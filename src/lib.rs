@@ -7,9 +7,9 @@ use std::mem;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use coco::epoch::{self, Garbage, Pin, TaggedAtomic, TaggedPtr};
+use coco::epoch::{self, Garbage, Pin, Atomic, Ptr};
 
 // TODO: a test where comparison function sometimes panics
 // TODO: Explain why TrustedOrd is not required
@@ -27,7 +27,7 @@ struct Node<K, V> {
     value: V,
     key: K,
     refs_and_height: AtomicUsize,
-    pointers: [TaggedAtomic<Node<K, V>>; 1],
+    pointers: [Atomic<Node<K, V>>; 1],
 }
 
 impl<K, V> Node<K, V> {
@@ -35,10 +35,11 @@ impl<K, V> Node<K, V> {
         assert!(1 <= height && height <= HEIGHT);
 
         let base_size = mem::size_of::<Self>();
-        let ptr_size = mem::size_of::<TaggedAtomic<Self>>();
+        let ptr_size = mem::size_of::<Atomic<Self>>();
         base_size.checked_add(ptr_size.checked_mul(height - 1).unwrap()).unwrap()
     }
 
+    // TODO: why unsafe?
     unsafe fn alloc(height: usize) -> *mut Self {
         let size_u64 = mem::size_of::<u64>();
         let align_u64 = mem::align_of::<u64>();
@@ -78,7 +79,6 @@ impl<K, V> Node<K, V> {
 
         ptr::drop_in_place(&mut (*ptr).key);
         ptr::drop_in_place(&mut (*ptr).value);
-        println!("DROP");
 
         if align <= align_u64 {
             let cap = (size.checked_add(size_u64).unwrap() - 1) / size_u64;
@@ -94,7 +94,7 @@ impl<K, V> Node<K, V> {
     }
 
     // TODO: Explain why this is not marked as unsafe (annoying)
-    fn tower(&self, level: usize) -> &TaggedAtomic<Self> {
+    fn tower(&self, level: usize) -> &Atomic<Self> {
         // TODO: debug assert bound checking
         unsafe { &*self.pointers.as_ptr().offset(level as isize) }
     }
@@ -162,11 +162,11 @@ impl<K: Ord, V> Skiplist<K, V> {
         // TODO: tagged nodes, relinking, etc.
         // TODO: shorter pinning
         epoch::pin(|pin| {
-            let mut curr = unsafe { (*self.head).tower(0).load(SeqCst, pin) };
+            let mut curr = unsafe { (*self.head).tower(0).load(pin) };
 
             let mut count = 0;
             while let Some(c) = curr.as_ref() {
-                curr = c.tower(0).load(SeqCst, pin);
+                curr = c.tower(0).load(pin);
                 count += 1;
             }
             count
@@ -189,21 +189,21 @@ impl<K: Ord, V> Skiplist<K, V> {
         key: &Q,
         from: &'p Node<K, V>,
         pin: &'p Pin
-    ) -> Result<(&'p Node<K, V>, TaggedPtr<'p, Node<K, V>>), ()>
+    ) -> Result<(&'p Node<K, V>, Ptr<'p, Node<K, V>>), ()>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
     {
         let mut pred = from;
-        let mut curr = pred.tower(level).load(SeqCst, pin);
+        let mut curr = pred.tower(level).load(pin);
         if curr.tag() == 1 {
             return Err(());
         }
 
         while let Some(c) = curr.as_ref() {
-            let succ = c.tower(level).load(SeqCst, pin);
+            let succ = c.tower(level).load(pin);
 
             if succ.tag() == 1 {
-                match pred.tower(level).cas(curr, succ.with_tag(0), SeqCst) {
+                match pred.tower(level).cas(curr, succ.with_tag(0)) {
                     Ok(_) => c.dec(&self.garbage),
                     Err(_) => return Err(()),
                 }
@@ -223,12 +223,12 @@ impl<K: Ord, V> Skiplist<K, V> {
         &self,
         key: &Q,
         pin: &'p Pin
-    ) -> (bool, [&'p Node<K, V>; HEIGHT], [TaggedPtr<'p, Node<K, V>>; HEIGHT])
+    ) -> (bool, [&'p Node<K, V>; HEIGHT], [Ptr<'p, Node<K, V>>; HEIGHT])
         where K: Borrow<Q>,
               Q: Ord + ?Sized
     {
         let (mut left, mut right) = unsafe {
-            mem::uninitialized::<([&Node<K, V>; HEIGHT], [TaggedPtr<Node<K, V>>; HEIGHT])>()
+            mem::uninitialized::<([&Node<K, V>; HEIGHT], [Ptr<Node<K, V>>; HEIGHT])>()
         };
         'search: loop {
             let mut curr = unsafe { &*self.head };
@@ -271,13 +271,13 @@ impl<K: Ord, V> Skiplist<K, V> {
                 let n = Node::<K, V>::alloc(height);
                 (*n).key = key;
                 (*n).value = value;
-                (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, SeqCst);
-                (TaggedPtr::<Node<K, V>>::from_raw(n, 0), &*n)
+                (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, AcqRel);
+                (Ptr::<Node<K, V>>::from_raw(n, 0), &*n)
             };
 
             loop {
-                c.tower(0).store(right[0], SeqCst);
-                if left[0].tower(0).cas(right[0], curr, SeqCst).is_ok() {
+                c.tower(0).store(right[0]);
+                if left[0].tower(0).cas(right[0], curr).is_ok() {
                     break;
                 }
 
@@ -300,7 +300,7 @@ impl<K: Ord, V> Skiplist<K, V> {
                     let succ = right[level];
 
                     // TODO: Explain why this if goes before the following if
-                    let next = c.tower(level).load(SeqCst, pin);
+                    let next = c.tower(level).load(pin);
                     if next.tag() == 1 {
                         break 'build;
                     }
@@ -315,12 +315,12 @@ impl<K: Ord, V> Skiplist<K, V> {
                     }
 
                     if next.as_raw() != succ.as_raw() {
-                        if c.tower(level).cas(next, succ, SeqCst).is_err() {
+                        if c.tower(level).cas(next, succ).is_err() {
                             break 'build;
                         }
                     }
 
-                    if pred.tower(level).cas(succ, curr, SeqCst).is_ok() {
+                    if pred.tower(level).cas(succ, curr).is_ok() {
                         built += 1;
                         break;
                     } else {
@@ -335,7 +335,7 @@ impl<K: Ord, V> Skiplist<K, V> {
                 c.dec(&self.garbage);
             }
 
-            if c.tower(0).load(SeqCst, pin).tag() == 1 {
+            if c.tower(0).load(pin).tag() == 1 {
                 self.search(&c.key, pin);
             }
 
@@ -358,9 +358,9 @@ impl<K: Ord, V> Skiplist<K, V> {
             let height = curr.height();
 
             for level in (0..height).rev() {
-                let mut next = curr.tower(level).load(SeqCst, pin);
+                let mut next = curr.tower(level).load(pin);
                 while next.tag() == 0 {
-                    match curr.tower(level).cas(next, next.with_tag(1), SeqCst) {
+                    match curr.tower(level).cas(next, next.with_tag(1)) {
                         Ok(()) => break,
                         Err(n) => next = n,
                     }
@@ -419,7 +419,7 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
             let done = epoch::pin(|pin| {
 
                 let head = unsafe { &*self.parent.head };
-                let candidate = head.tower(0).load(SeqCst, pin);
+                let candidate = head.tower(0).load(pin);
 
                 if candidate.tag() == 0 {
                     let success = match candidate.as_ref() {
@@ -455,14 +455,14 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
                 let candidate = match node_ref {
                     None => {
                         let head = unsafe { &*self.parent.head };
-                        head.tower(0).load(SeqCst, pin)
+                        head.tower(0).load(pin)
                     }
                     Some(node) => {
-                        let succ = node.tower(0).load(SeqCst, pin);
+                        let succ = node.tower(0).load(pin);
                         if succ.tag() == 1 {
                             let (found, _left, right) = self.parent.search(&node.key, pin);
                             if found {
-                                right[0].unwrap().tower(0).load(SeqCst, pin)
+                                right[0].unwrap().tower(0).load(pin)
                             } else {
                                 right[0]
                             }
@@ -504,11 +504,11 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
                         unimplemented!()
                     }
                     Some(node) => {
-                        let succ = node.tower(0).load(SeqCst, pin);
+                        let succ = node.tower(0).load(pin);
                         if succ.tag() == 1 {
                             let (found, _left, right) = self.parent.search(&node.key, pin);
                             if found {
-                                right[0].unwrap().tower(0).load(SeqCst, pin)
+                                right[0].unwrap().tower(0).load(pin)
                             } else {
                                 right[0]
                             }
@@ -607,17 +607,16 @@ mod tests {
                 }
             })
         }).collect::<Vec<_>>();
-        v.extend((0..T).map(|mut t| {
-            let my = my.clone();
-            thread::spawn(move || {
-                let mut num = t as u32;
-                for i in 0 .. 1_000_000 / T {
-                    println!("{} of {}", i, 1_000_000 / T);
-                    num = num.wrapping_mul(17).wrapping_add(255);
-                    my.remove(&num);
-                }
-            })
-        }));
+        // v.extend((0..T).map(|mut t| {
+        //     let my = my.clone();
+        //     thread::spawn(move || {
+        //         let mut num = t as u32;
+        //         for i in 0 .. 1_000_000 / T {
+        //             num = num.wrapping_mul(17).wrapping_add(255);
+        //             my.remove(&num);
+        //         }
+        //     })
+        // }));
         for h in v {
             h.join();
         }
@@ -627,7 +626,9 @@ mod tests {
         //     my.remove(&num);
         // }
 
+        let elapsed = now.elapsed();
         let now = Instant::now();
+
         let mut x = my.cursor();
         x.front();
         let mut steps = 0;
@@ -641,7 +642,7 @@ mod tests {
         }
         println!("STEPS: {}", steps);
 
-        let elapsed = now.elapsed();
+        // let elapsed = now.elapsed();
         println!("seconds: {:.3}", elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1e9);
         println!("LEN: {}", my.count());
     }
