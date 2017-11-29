@@ -1,4 +1,4 @@
-extern crate coco;
+extern crate crossbeam_epoch as epoch;
 
 use std::borrow::Borrow;
 use std::cmp;
@@ -9,13 +9,17 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use coco::epoch::{self, Garbage, Pin, Atomic, Ptr};
+use epoch::{Atomic, Guard, Owned, Shared};
 
 // TODO: a test where comparison function sometimes panics
 // TODO: Explain why TrustedOrd is not required
 // TODO: In remove directly relink instead of calling search_level?
 
 // TODO: Make sure not to execute user defined code within an epoch!! not even Drop for K and V
+
+// TODO: Idea: if using hazard pointers, we don't need the height - we can just tag the last pointer
+
+// TODO: See ThinArc in Servo
 
 const HEIGHT: usize = 1 << HEIGHT_BITS;
 const HEIGHT_BITS: usize = 5;
@@ -30,13 +34,18 @@ struct Node<K, V> {
     pointers: [Atomic<Node<K, V>>; 1],
 }
 
+unsafe impl<K, V> Send for Node<K, V> {}
+unsafe impl<K, V> Sync for Node<K, V> {}
+
 impl<K, V> Node<K, V> {
     fn size_with_height(height: usize) -> usize {
         assert!(1 <= height && height <= HEIGHT);
 
         let base_size = mem::size_of::<Self>();
         let ptr_size = mem::size_of::<Atomic<Self>>();
-        base_size.checked_add(ptr_size.checked_mul(height - 1).unwrap()).unwrap()
+        base_size
+            .checked_add(ptr_size.checked_mul(height - 1).unwrap())
+            .unwrap()
     }
 
     // TODO: why unsafe?
@@ -61,16 +70,13 @@ impl<K, V> Node<K, V> {
             ptr
         };
 
-        unsafe {
-            (*ptr).refs_and_height = AtomicUsize::new((height << HEIGHT_BITS) | height);
-            ptr::write_bytes(&mut (*ptr).pointers[0], 0, height);
-        }
+        (*ptr).refs_and_height = AtomicUsize::new((height << HEIGHT_BITS) | height);
+        ptr::write_bytes(&mut (*ptr).pointers[0], 0, height);
+
         ptr
     }
 
-    unsafe fn destroy(ptr: *mut Self, count: usize) {
-        debug_assert!(count == 1);
-
+    unsafe fn destroy(ptr: *mut Self) {
         let size_u64 = mem::size_of::<u64>();
         let align_u64 = mem::align_of::<u64>();
 
@@ -93,21 +99,22 @@ impl<K, V> Node<K, V> {
         self.refs_and_height.load(Relaxed) & HEIGHT_MASK
     }
 
-    // TODO: Explain why this is not marked as unsafe (annoying)
-    fn tower(&self, level: usize) -> &Atomic<Self> {
+    unsafe fn tower(&self, level: usize) -> &Atomic<Self> {
         // TODO: debug assert bound checking
-        unsafe { &*self.pointers.as_ptr().offset(level as isize) }
+        &*self.pointers.as_ptr().offset(level as isize)
     }
 
-    fn inc(&self) -> bool {
-        let mut old = self.refs_and_height.load(Relaxed);
+    unsafe fn acquire(ptr: Shared<Self>) -> bool {
+        let mut old = ptr.deref().refs_and_height.load(Relaxed);
 
         while old & !HEIGHT_MASK > 0 {
             // TODO: explain that we need checked_add for safety (with mem::forget it's possible to
             // overflow)
             let new = old.checked_add(1 << HEIGHT_BITS).unwrap();
 
-            match self.refs_and_height.compare_exchange_weak(old, new, AcqRel, Acquire) {
+            match ptr.deref().refs_and_height
+                .compare_exchange_weak(old, new, AcqRel, Acquire)
+            {
                 Ok(_) => return true,
                 Err(o) => old = o,
             }
@@ -115,12 +122,13 @@ impl<K, V> Node<K, V> {
         false
     }
 
-    fn dec(&self, garbage: &Garbage) {
-        if self.refs_and_height.fetch_sub(1 << HEIGHT_BITS, AcqRel) >> HEIGHT_BITS == 1 {
-            epoch::pin(|pin| {
-                let ptr = self as *const _ as *mut Self;
-                unsafe { garbage.defer_destroy(Node::destroy, ptr, 1, pin); }
-            })
+    unsafe fn release(ptr: Shared<Self>) {
+        if ptr.deref().refs_and_height.fetch_sub(1 << HEIGHT_BITS, AcqRel) >> HEIGHT_BITS == 1 {
+            let guard = epoch::pin();
+
+            unsafe {
+                guard.defer(move || Node::destroy(ptr.as_raw() as *mut Self));
+            }
         }
     }
 }
@@ -128,7 +136,6 @@ impl<K, V> Node<K, V> {
 pub struct Skiplist<K, V> {
     head: *mut Node<K, V>, // !Send + !Sync
     seed: AtomicUsize,
-    garbage: Garbage,
 }
 
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for Skiplist<K, V> {}
@@ -142,7 +149,6 @@ impl<K: Ord, V> Skiplist<K, V> {
         Skiplist {
             head: unsafe { Node::alloc(HEIGHT) },
             seed: AtomicUsize::new(1),
-            garbage: Garbage::new(),
         }
     }
 
@@ -151,8 +157,8 @@ impl<K: Ord, V> Skiplist<K, V> {
     // TODO: cursor(&self) -> Cursor<K, V>
     // TODO: insert(&self, k, v) -> Result<Cursor<K, V>, Cursor<K, V>>
     // TODO: remove(&self, k, v) -> Option<Cursor<K, V>>
-    // TODO: first(&self) -> Cursor<K, V>
-    // TODO: last(&self) -> Cursor<K, V>
+    // TODO: front(&self) -> Cursor<K, V>
+    // TODO: back(&self) -> Cursor<K, V>
     // TODO: get(&self, k) -> Option<Cursor<K, V>>
 
     /// Counts the elements in the skiplist.
@@ -161,16 +167,18 @@ impl<K: Ord, V> Skiplist<K, V> {
     pub fn count(&self) -> usize {
         // TODO: tagged nodes, relinking, etc.
         // TODO: shorter pinning
-        epoch::pin(|pin| {
-            let mut curr = unsafe { (*self.head).tower(0).load(pin) };
+        let guard = &epoch::pin();
+
+        unsafe {
+            let mut curr = unsafe { (*self.head).tower(0).load(SeqCst, guard) };
 
             let mut count = 0;
             while let Some(c) = curr.as_ref() {
-                curr = c.tower(0).load(pin);
+                curr = c.tower(0).load(SeqCst, guard);
                 count += 1;
             }
             count
-        })
+        }
     }
 
     fn random_height(&self) -> usize {
@@ -183,28 +191,29 @@ impl<K: Ord, V> Skiplist<K, V> {
         cmp::min(num.trailing_zeros() as usize + 1, HEIGHT)
     }
 
-    fn search_level<'p, Q>(
+    unsafe fn search_level<'g, Q>(
         &self,
         level: usize,
         key: &Q,
-        from: &'p Node<K, V>,
-        pin: &'p Pin
-    ) -> Result<(&'p Node<K, V>, Ptr<'p, Node<K, V>>), ()>
-        where K: Borrow<Q>,
-              Q: Ord + ?Sized
+        from: &'g Node<K, V>,
+        guard: &'g Guard,
+    ) -> Result<(&'g Node<K, V>, Shared<'g, Node<K, V>>), ()>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
     {
         let mut pred = from;
-        let mut curr = pred.tower(level).load(pin);
+        let mut curr = pred.tower(level).load(SeqCst, guard);
         if curr.tag() == 1 {
             return Err(());
         }
 
         while let Some(c) = curr.as_ref() {
-            let succ = c.tower(level).load(pin);
+            let succ = c.tower(level).load(SeqCst, guard);
 
             if succ.tag() == 1 {
-                match pred.tower(level).cas(curr, succ.with_tag(0)) {
-                    Ok(_) => c.dec(&self.garbage),
+                match pred.tower(level).compare_and_set(curr, succ.with_tag(0), SeqCst, guard) {
+                    Ok(_) => Node::release(curr),
                     Err(_) => return Err(()),
                 }
                 curr = succ.with_tag(0);
@@ -219,22 +228,26 @@ impl<K: Ord, V> Skiplist<K, V> {
         Ok((pred, curr))
     }
 
-    fn search<'p, Q>(
+    unsafe fn search<'g, Q>(
         &self,
         key: &Q,
-        pin: &'p Pin
-    ) -> (bool, [&'p Node<K, V>; HEIGHT], [Ptr<'p, Node<K, V>>; HEIGHT])
-        where K: Borrow<Q>,
-              Q: Ord + ?Sized
+        guard: &'g Guard,
+    ) -> (
+        bool,
+        [&'g Node<K, V>; HEIGHT],
+        [Shared<'g, Node<K, V>>; HEIGHT],
+    )
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
     {
-        let (mut left, mut right) = unsafe {
-            mem::uninitialized::<([&Node<K, V>; HEIGHT], [Ptr<Node<K, V>>; HEIGHT])>()
-        };
+        let (mut left, mut right) =
+            mem::uninitialized::<([&Node<K, V>; HEIGHT], [Shared<Node<K, V>>; HEIGHT])>();
         'search: loop {
-            let mut curr = unsafe { &*self.head };
+            let mut curr = &*self.head;
 
             for level in (0..HEIGHT).rev() {
-                match self.search_level(level, key, curr, pin) {
+                match self.search_level(level, key, curr, guard) {
                     Ok((l, r)) => {
                         left[level] = l;
                         right[level] = r;
@@ -254,15 +267,16 @@ impl<K: Ord, V> Skiplist<K, V> {
 
     pub fn insert(&self, key: K, value: V) -> Result<Cursor<K, V>, Cursor<K, V>> {
         // TODO: what about panic safety?
-        epoch::pin(|pin| {
+        let guard = &epoch::pin();
 
-            // self.garbage.collect(pin);
+        // self.garbage.collect(guard);
 
-            let (found, mut left, mut right) = self.search(&key, pin);
+        unsafe {
+            let (found, mut left, mut right) = self.search(&key, guard);
             if found {
-                let r = right[0].unwrap();
-                if r.inc() {
-                    return Err(Cursor::new(self, r));
+                let r = right[0];
+                if Node::acquire(r) {
+                    return Err(Cursor::new(self, r.deref()));
                 }
             }
 
@@ -272,23 +286,23 @@ impl<K: Ord, V> Skiplist<K, V> {
                 (*n).key = key;
                 (*n).value = value;
                 (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, AcqRel);
-                (Ptr::<Node<K, V>>::from_raw(n, 0), &*n)
+                (Shared::<Node<K, V>>::from(n as *const _), &*n)
             };
 
             loop {
-                c.tower(0).store(right[0]);
-                if left[0].tower(0).cas(right[0], curr).is_ok() {
+                c.tower(0).store(right[0], SeqCst);
+                if left[0].tower(0).compare_and_set(right[0], curr, SeqCst, guard).is_ok() {
                     break;
                 }
 
-                let (found, l, r) = self.search(&c.key, pin);
+                let (found, l, r) = self.search(&c.key, guard);
                 left = l;
                 right = r;
                 if found {
-                    let r = right[0].unwrap();
-                    if r.inc() {
+                    let r = right[0];
+                    if Node::acquire(r) {
                         // TODO: deallocate curr (should probably be in a panic-safe guard)
-                        return Err(Cursor::new(self, r as *const _ as *mut _));
+                        return Err(Cursor::new(self, r.as_raw() as *mut _));
                     }
                 }
             }
@@ -300,14 +314,14 @@ impl<K: Ord, V> Skiplist<K, V> {
                     let succ = right[level];
 
                     // TODO: Explain why this if goes before the following if
-                    let next = c.tower(level).load(pin);
+                    let next = c.tower(level).load(SeqCst, guard);
                     if next.tag() == 1 {
                         break 'build;
                     }
 
                     if let Some(s) = succ.as_ref() {
                         if &s.key == &c.key {
-                            let (_, l, r) = self.search(&c.key, pin);
+                            let (_, l, r) = self.search(&c.key, guard);
                             left = l;
                             right = r;
                             continue;
@@ -315,16 +329,16 @@ impl<K: Ord, V> Skiplist<K, V> {
                     }
 
                     if next.as_raw() != succ.as_raw() {
-                        if c.tower(level).cas(next, succ).is_err() {
+                        if c.tower(level).compare_and_set(next, succ, SeqCst, guard).is_err() {
                             break 'build;
                         }
                     }
 
-                    if pred.tower(level).cas(succ, curr).is_ok() {
+                    if pred.tower(level).compare_and_set(succ, curr, SeqCst, guard).is_ok() {
                         built += 1;
                         break;
                     } else {
-                        let (_, l, r) = self.search(&c.key, pin);
+                        let (_, l, r) = self.search(&c.key, guard);
                         left = l;
                         right = r;
                     }
@@ -332,54 +346,56 @@ impl<K: Ord, V> Skiplist<K, V> {
             }
 
             for _ in built..height {
-                c.dec(&self.garbage);
+                Node::release(curr);
             }
 
-            if c.tower(0).load(pin).tag() == 1 {
-                self.search(&c.key, pin);
+            if c.tower(0).load(SeqCst, guard).tag() == 1 {
+                self.search(&c.key, guard);
             }
 
             Ok(Cursor::new(self, c as *const _ as *mut _))
-        })
+        }
     }
 
     pub fn remove<Q>(&self, key: &Q) -> bool
-        where K: Borrow<Q> + Ord,
-              Q: Ord + ?Sized
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
     {
-        epoch::pin(|pin| {
+        let guard = &epoch::pin();
 
-            let (found, mut left, mut right) = self.search(key, pin);
+        unsafe {
+            let (found, mut left, mut right) = self.search(key, guard);
             if !found {
                 return false;
             }
 
-            let curr = right[0].unwrap();
+            let curr = right[0].deref();
             let height = curr.height();
 
             for level in (0..height).rev() {
-                let mut next = curr.tower(level).load(pin);
+                let mut next = curr.tower(level).load(SeqCst, guard);
                 while next.tag() == 0 {
-                    match curr.tower(level).cas(next, next.with_tag(1)) {
-                        Ok(()) => break,
-                        Err(n) => next = n,
+                    match curr.tower(level).compare_and_set(next, next.with_tag(1), SeqCst, guard) {
+                        Ok(_) => break,
+                        Err(err) => next = err.current,
                     }
                 }
 
                 if level == 0 && next.tag() == 0 {
                     // TODO: try relinking manually, decrement by the number of successful relinks
                     for i in (0..height).rev() {
-                        if self.search_level(i, key, left[i], pin).is_err() {
-                            self.search(key, pin);
+                        if self.search_level(i, key, left[i], guard).is_err() {
+                            self.search(key, guard);
                             break;
                         }
                     }
                     return true;
                 }
             }
+        }
 
-            false
-        })
+        false
     }
 
     pub fn cursor(&self) -> Cursor<K, V> {
@@ -412,142 +428,142 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
     // TODO: remove(&self) -> bool
     // TODO: is_valid(&self) -> bool
 
-    pub fn front(&mut self) {
-        let node_ref = unsafe { self.node.as_ref() };
-
-        loop {
-            let done = epoch::pin(|pin| {
-
-                let head = unsafe { &*self.parent.head };
-                let candidate = head.tower(0).load(pin);
-
-                if candidate.tag() == 0 {
-                    let success = match candidate.as_ref() {
-                        None => true,
-                        Some(c) => c.inc(),
-                    };
-
-                    if success {
-                        node_ref.map(|node| node.dec(&self.parent.garbage));
-                        self.node = candidate.as_raw();
-                        return true;
-                    }
-                }
-                false
-            });
-
-            if done {
-                break;
-            }
-        }
-    }
+    // pub fn front(&mut self) {
+    //     let node_ref = unsafe { self.node.as_ref() };
+    //
+    //     loop {
+    //         let done = epoch::pin(|guard| {
+    //
+    //             let head = unsafe { &*self.parent.head };
+    //             let candidate = head.tower(0).load(guard);
+    //
+    //             if candidate.tag() == 0 {
+    //                 let success = match candidate.as_ref() {
+    //                     None => true,
+    //                     Some(c) => c.inc(),
+    //                 };
+    //
+    //                 if success {
+    //                     node_ref.map(|node| node.dec(&self.parent.garbage));
+    //                     self.node = candidate.as_raw();
+    //                     return true;
+    //                 }
+    //             }
+    //             false
+    //         });
+    //
+    //         if done {
+    //             break;
+    //         }
+    //     }
+    // }
 
     pub fn back(&mut self) {
         unimplemented!()
     }
 
-    pub fn next(&mut self) {
-        let node_ref = unsafe { self.node.as_ref() };
+    // pub fn next(&mut self) {
+    //     let node_ref = unsafe { self.node.as_ref() };
+    //
+    //     loop {
+    //         let done = epoch::pin(|guard| {
+    //
+    //             let candidate = match node_ref {
+    //                 None => {
+    //                     let head = unsafe { &*self.parent.head };
+    //                     head.tower(0).load(guard)
+    //                 }
+    //                 Some(node) => {
+    //                     let succ = node.tower(0).load(guard);
+    //                     if succ.tag() == 1 {
+    //                         let (found, _left, right) = self.parent.search(&node.key, guard);
+    //                         if found {
+    //                             right[0].unwrap().tower(0).load(guard)
+    //                         } else {
+    //                             right[0]
+    //                         }
+    //                     } else {
+    //                         succ
+    //                     }
+    //                 }
+    //             };
+    //
+    //             if candidate.tag() == 0 {
+    //                 let success = match candidate.as_ref() {
+    //                     None => true,
+    //                     Some(c) => c.inc(),
+    //                 };
+    //
+    //                 if success {
+    //                     node_ref.map(|node| node.dec(&self.parent.garbage));
+    //                     self.node = candidate.as_raw();
+    //                     return true;
+    //                 }
+    //             }
+    //             false
+    //         });
+    //
+    //         if done {
+    //             break;
+    //         }
+    //     }
+    // }
 
-        loop {
-            let done = epoch::pin(|pin| {
+    // pub fn previous(&mut self) {
+    //     let node_ref = unsafe { self.node.as_ref() };
+    //
+    //     loop {
+    //         let done = epoch::pin(|guard| {
+    //
+    //             let candidate = match node_ref {
+    //                 None => {
+    //                     unimplemented!()
+    //                 }
+    //                 Some(node) => {
+    //                     let succ = node.tower(0).load(guard);
+    //                     if succ.tag() == 1 {
+    //                         let (found, _left, right) = self.parent.search(&node.key, guard);
+    //                         if found {
+    //                             right[0].unwrap().tower(0).load(guard)
+    //                         } else {
+    //                             right[0]
+    //                         }
+    //                     } else {
+    //                         succ
+    //                     }
+    //                 }
+    //             };
+    //
+    //             if candidate.tag() == 0 {
+    //                 let success = match candidate.as_ref() {
+    //                     None => true,
+    //                     Some(c) => c.inc(),
+    //                 };
+    //
+    //                 if success {
+    //                     node_ref.map(|node| node.dec(&self.parent.garbage));
+    //                     self.node = candidate.as_raw();
+    //                     return true;
+    //                 }
+    //             }
+    //             false
+    //         });
+    //
+    //         if done {
+    //             break;
+    //         }
+    //     }
+    // }
 
-                let candidate = match node_ref {
-                    None => {
-                        let head = unsafe { &*self.parent.head };
-                        head.tower(0).load(pin)
-                    }
-                    Some(node) => {
-                        let succ = node.tower(0).load(pin);
-                        if succ.tag() == 1 {
-                            let (found, _left, right) = self.parent.search(&node.key, pin);
-                            if found {
-                                right[0].unwrap().tower(0).load(pin)
-                            } else {
-                                right[0]
-                            }
-                        } else {
-                            succ
-                        }
-                    }
-                };
-
-                if candidate.tag() == 0 {
-                    let success = match candidate.as_ref() {
-                        None => true,
-                        Some(c) => c.inc(),
-                    };
-
-                    if success {
-                        node_ref.map(|node| node.dec(&self.parent.garbage));
-                        self.node = candidate.as_raw();
-                        return true;
-                    }
-                }
-                false
-            });
-
-            if done {
-                break;
-            }
-        }
-    }
-
-    pub fn previous(&mut self) {
-        let node_ref = unsafe { self.node.as_ref() };
-
-        loop {
-            let done = epoch::pin(|pin| {
-
-                let candidate = match node_ref {
-                    None => {
-                        unimplemented!()
-                    }
-                    Some(node) => {
-                        let succ = node.tower(0).load(pin);
-                        if succ.tag() == 1 {
-                            let (found, _left, right) = self.parent.search(&node.key, pin);
-                            if found {
-                                right[0].unwrap().tower(0).load(pin)
-                            } else {
-                                right[0]
-                            }
-                        } else {
-                            succ
-                        }
-                    }
-                };
-
-                if candidate.tag() == 0 {
-                    let success = match candidate.as_ref() {
-                        None => true,
-                        Some(c) => c.inc(),
-                    };
-
-                    if success {
-                        node_ref.map(|node| node.dec(&self.parent.garbage));
-                        self.node = candidate.as_raw();
-                        return true;
-                    }
-                }
-                false
-            });
-
-            if done {
-                break;
-            }
-        }
-    }
-
-    pub fn is_removed(&self) -> bool {
-        match unsafe { self.node.as_ref() } {
-            None => false,
-            Some(r) => {
-                let (_ptr, tag) = r.tower(0).load_raw(Acquire);
-                tag == 1
-            }
-        }
-    }
+    // pub fn is_removed(&self) -> bool {
+    //     match unsafe { self.node.as_ref() } {
+    //         None => false,
+    //         Some(r) => {
+    //             let (_ptr, tag) = r.tower(0).load_raw(Acquire);
+    //             tag == 1
+    //         }
+    //     }
+    // }
 
     pub fn is_null(&self) -> bool {
         self.node.is_null()
@@ -562,8 +578,9 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
     }
 
     pub fn seek<Q>(&mut self, key: &Q) -> bool
-        where K: Borrow<Q>,
-              Q: Ord + ?Sized
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
     {
         unimplemented!()
     }
@@ -575,7 +592,7 @@ impl<'a, K: Ord, V> Cursor<'a, K, V> {
 
 impl<'a, K, V> Drop for Cursor<'a, K, V> {
     fn drop(&mut self) {
-        unsafe { self.node.as_ref().map(|node| node.dec(&self.parent.garbage)); }
+        // unsafe { self.node.as_ref().map(|node| node.dec(&self.parent.garbage)); }
     }
 }
 
@@ -589,7 +606,7 @@ mod tests {
     use std::ptr;
 
     #[test]
-    fn it_works() {
+    fn foo() {
         let s = Skiplist::new();
         let my = Arc::new(s);
 
@@ -597,16 +614,21 @@ mod tests {
         let now = Instant::now();
 
         const T: usize = 1;
-        let mut v = (0..T).map(|mut t| {
-            let my = my.clone();
-            thread::spawn(move || {
-                let mut num = t as u32;
-                for i in 0 .. 1_000_000 / T {
-                    num = num.wrapping_mul(17).wrapping_add(255);
-                    my.insert(num, !num);
-                }
+        let mut v = (0..T)
+            .map(|mut t| {
+                let my = my.clone();
+                thread::spawn(move || {
+                    let mut num = t as u32;
+                    for i in 0..1_000_000 / T {
+                        num = num.wrapping_mul(17).wrapping_add(255);
+                        my.insert(num, !num);
+                    }
+                })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
+        for h in v.drain(..) {
+            h.join().unwrap();
+        }
         // v.extend((0..T).map(|mut t| {
         //     let my = my.clone();
         //     thread::spawn(move || {
@@ -617,33 +639,81 @@ mod tests {
         //         }
         //     })
         // }));
-        for h in v {
-            h.join();
-        }
-        // let mut num = 0 as u32;
-        // for i in 0 .. 1_000_000 / T {
-        //     num = num.wrapping_mul(17).wrapping_add(255);
-        //     my.remove(&num);
+        // for h in v {
+        //     h.join().unwrap();
         // }
 
         let elapsed = now.elapsed();
-        let now = Instant::now();
-
-        let mut x = my.cursor();
-        x.front();
-        let mut steps = 0;
-        while !x.is_null() {
-            // unsafe {
-            //     let node = x.node.as_ref().unwrap();
-            //     assert_eq!(node.data.refs.load(Relaxed), node.data.height as usize + 1);
-            // }
-            x.next();
-            steps += 1;
-        }
-        println!("STEPS: {}", steps);
 
         // let elapsed = now.elapsed();
-        println!("seconds: {:.3}", elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1e9);
+        println!(
+            "seconds: {:.3}",
+            elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1e9
+        );
         println!("LEN: {}", my.count());
     }
+
+    // #[test]
+    // fn it_works() {
+    //     let s = Skiplist::new();
+    //     let my = Arc::new(s);
+    //
+    //     use std::time::{Duration, Instant};
+    //     let now = Instant::now();
+    //
+    //     const T: usize = 1;
+    //     let mut v = (0..T)
+    //         .map(|mut t| {
+    //             let my = my.clone();
+    //             thread::spawn(move || {
+    //                 let mut num = t as u32;
+    //                 for i in 0..1_000_000 / T {
+    //                     num = num.wrapping_mul(17).wrapping_add(255);
+    //                     my.insert(num, !num);
+    //                 }
+    //             })
+    //         })
+    //         .collect::<Vec<_>>();
+    //     // v.extend((0..T).map(|mut t| {
+    //     //     let my = my.clone();
+    //     //     thread::spawn(move || {
+    //     //         let mut num = t as u32;
+    //     //         for i in 0 .. 1_000_000 / T {
+    //     //             num = num.wrapping_mul(17).wrapping_add(255);
+    //     //             my.remove(&num);
+    //     //         }
+    //     //     })
+    //     // }));
+    //     for h in v {
+    //         h.join();
+    //     }
+    //     // let mut num = 0 as u32;
+    //     // for i in 0 .. 1_000_000 / T {
+    //     //     num = num.wrapping_mul(17).wrapping_add(255);
+    //     //     my.remove(&num);
+    //     // }
+    //
+    //     let elapsed = now.elapsed();
+    //     let now = Instant::now();
+    //
+    //     let mut x = my.cursor();
+    //     x.front();
+    //     let mut steps = 0;
+    //     while !x.is_null() {
+    //         // unsafe {
+    //         //     let node = x.node.as_ref().unwrap();
+    //         //     assert_eq!(node.data.refs.load(Relaxed), node.data.height as usize + 1);
+    //         // }
+    //         x.next();
+    //         steps += 1;
+    //     }
+    //     println!("STEPS: {}", steps);
+    //
+    //     // let elapsed = now.elapsed();
+    //     println!(
+    //         "seconds: {:.3}",
+    //         elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1e9
+    //     );
+    //     println!("LEN: {}", my.count());
+    // }
 }
