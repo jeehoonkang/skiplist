@@ -23,8 +23,11 @@ use epoch::{Atomic, Guard, Shared};
 // TODO: inspiration is RocksDB's skiplist
 // TODO: another inspiration is ConcurrentSkipListMap (not necessarily as fast as possible)
 
-const MAX_HEIGHT: usize = 1 << HEIGHT_BITS;
-const HEIGHT_BITS: usize = 5;
+// TODO: Cursor::index_estimate()
+
+const BRANCHING: usize = 4;
+const MAX_HEIGHT: usize = 12;
+const HEIGHT_BITS: usize = 4;
 const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
 
 /// A skiplist node.
@@ -197,13 +200,17 @@ impl<K, V> Skiplist<K, V> {
     fn random_height(&self) -> usize {
         // From "Xorshift RNGs" by George Marsaglia.
         let mut num = self.seed.load(Relaxed);
-        num ^= num << 13;
-        num ^= num >> 17;
-        num ^= num << 5;
+        num ^= num >> 12;
+        num ^= num << 25;
+        num ^= num >> 27;
+        num = num.wrapping_mul(0x2545F4914F6CDD1D);
         self.seed.store(num, Relaxed);
 
-        let height = cmp::min(num.trailing_zeros() as usize + 1, MAX_HEIGHT) * 2 / 2;
-        debug_assert!(1 <= height && height <= MAX_HEIGHT);
+        let mut height = 1;
+        while height < MAX_HEIGHT && num % BRANCHING == 1 {
+            height += 1;
+            num /= BRANCHING;
+        }
         height
     }
 }
@@ -241,7 +248,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
         let guard = &epoch::pin();
 
         // First try searching for the key.
-        let mut s = self.search(Some(&key), guard);
+        let mut s = self.search(|k| k.cmp(&key), guard);
 
         // If a node with the key was found, let's try creating a cursor pointing at it.
         if s.found {
@@ -293,7 +300,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
             }
 
             // We failed. Let's search for the key and try again.
-            s = self.search(Some(&n.key), guard);
+            s = self.search(|k| k.cmp(&n.key), guard);
 
             // Have we found a node with the key this time?
             if s.found {
@@ -354,7 +361,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
                 // deleted and should be unlinked from the skiplist. In that case, let's repeat the
                 // search to make sure it gets unlinked and try again.
                 if unsafe { succ.as_ref().map(|s| &s.key) } == Some(&n.key) {
-                    s = self.search(Some(&n.key), guard);
+                    s = self.search(|k| k.cmp(&n.key), guard);
                     continue;
                 }
 
@@ -385,7 +392,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
                 (*n).refs_and_height.fetch_sub(1 << HEIGHT_BITS, Relaxed);
 
                 // We don't have the most up-to-date search results. Repeat the search.
-                s = self.search(Some(&n.key), guard);
+                s = self.search(|k| k.cmp(&n.key), guard);
             }
         }
 
@@ -395,7 +402,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
         // the new node at one of the higher levels. In order to undo that installation, we must
         // repeat the search, which will unlink the new node at that level.
         if n.tower()[height - 1].load(SeqCst, guard).tag() == 1 {
-            self.search(Some(&n.key), guard);
+            self.search(|k| k.cmp(&n.key), guard);
         }
 
         Ok(cursor)
@@ -418,7 +425,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
         let guard = &epoch::pin();
 
         // Try searching for the key.
-        let s = self.search(Some(key), guard);
+        let s = self.search(|k| k.cmp(key), guard);
         if !s.found {
             return false;
         }
@@ -446,7 +453,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
                     Node::decrement(n);
                 }
             } else {
-                self.search(Some(key), guard);
+                self.search(|k| k.cmp(key), guard);
                 break;
             }
         }
@@ -454,10 +461,12 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
         true
     }
 
-    fn search<'g, Q>(&self, key: Option<&Q>, guard: &'g Guard) -> Search<'g, K, V>
+    // TODO: doc: searches the first such that f(key) != Less
+    fn search<'g, Q, F>(&self, mut f: F, guard: &'g Guard) -> Search<'g, K, V>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        F: FnMut(&Q) -> cmp::Ordering,
     {
         let mut s = Search {
             found: false,
@@ -513,7 +522,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
 
                     // If `curr` contains a key that is greater than or equal to `key`, we're done
                     // with this level.
-                    if key.map(|k| c.key.borrow() >= k) == Some(true) {
+                    if f(c.key.borrow()) != cmp::Ordering::Less {
                         break;
                     }
 
@@ -531,7 +540,7 @@ impl<K: Ord + Send + 'static, V> Skiplist<K, V> {
 
             // Check if we have found a node with key equal to `key`.
             s.found = unsafe {
-                s.right[0].as_ref().map(|r| Some(r.key.borrow()) == key) == Some(true)
+                s.right[0].as_ref().map(|r| f(r.key.borrow())) == Some(cmp::Ordering::Equal)
             };
 
             return s;
@@ -561,7 +570,7 @@ impl<'a, K: Ord + Send + 'static, V> Cursor<'a, K, V> {
     }
 
     /// Returns `true` if the cursor is pointing at an alive element.
-    pub fn is_valid(&self) -> bool {
+    pub fn is_alive(&self) -> bool {
         unsafe {
             self.node
                 .as_ref()
@@ -603,7 +612,7 @@ impl<'a, K: Ord + Send + 'static, V> Cursor<'a, K, V> {
                     if succ.tag() == 0 {
                         succ
                     } else {
-                        let s = self.parent.search(Some(&node.key), guard);
+                        let s = self.parent.search(|k| k.cmp(&node.key), guard);
                         if s.found {
                             unsafe { s.right[0].deref().tower()[0].load(SeqCst, guard) }
                         } else {
@@ -639,7 +648,10 @@ impl<'a, K: Ord + Send + 'static, V> Cursor<'a, K, V> {
     pub fn prev(&mut self) {
         loop {
             let guard = &epoch::pin();
-            let s = self.parent.search(self.key(), guard);
+            let s = match self.key() {
+                None => self.parent.search(|_| cmp::Ordering::Less, guard),
+                Some(key) => self.parent.search(|k| k.cmp(key), guard),
+            };
             let pred = s.left[0];
 
             unsafe {
@@ -664,9 +676,18 @@ impl<'a, K: Ord + Send + 'static, V> Cursor<'a, K, V> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        self.seek_by(|k| k.cmp(key))
+    }
+
+    pub fn seek_by<Q, F>(&mut self, mut f: F) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized,
+        F: FnMut(&Q) -> cmp::Ordering,
+    {
         loop {
             let guard = &epoch::pin();
-            let s = self.parent.search(Some(key.borrow()), guard);
+            let s = self.parent.search(|k| f(k), guard);
             let node = s.right[0].as_raw();
 
             unsafe {
@@ -677,6 +698,16 @@ impl<'a, K: Ord + Send + 'static, V> Cursor<'a, K, V> {
                 }
             }
         }
+    }
+
+    pub fn seek_to_first(&mut self) {
+        *self = self.parent.cursor();
+        self.next();
+    }
+
+    pub fn seek_to_last(&mut self) {
+        *self = self.parent.cursor();
+        self.prev();
     }
 
     pub fn remove(&self) -> bool {
@@ -715,7 +746,7 @@ mod tests {
                 let my = my.clone();
                 thread::spawn(move || {
                     let mut num = t as u32;
-                    for i in 0..1000_000 / T {
+                    for i in 0..1_000_000 / T {
                         num = num.wrapping_mul(17).wrapping_add(255);
                         my.insert(num, !num);
                     }
@@ -768,7 +799,7 @@ mod tests {
         my.insert(30, 0);
 
         let mut c = my.cursor();
-        println!("{:?}", c.seek(&0));
+        println!("{:?}", c.seek(&33));
         println!("-> {:?}", c.key());
     }
 
