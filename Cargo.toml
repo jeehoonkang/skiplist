@@ -6,3 +6,4 @@ license = "Apache-2.0/MIT"
 
 [dependencies]
 crossbeam-epoch = "0.2.0"
+scopeguard = "0.3.0"
