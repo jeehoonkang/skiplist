@@ -10,10 +10,6 @@ use epoch::{self, Atomic, Guard, Shared};
 // TODO: a test where comparison function sometimes panics
 // TODO: Explain why TrustedOrd is not required
 
-// TODO: inspiration is RocksDB's skip list
-// TODO: another inspiration is ConcurrentSkipListMap (not necessarily as fast as possible)
-// NOTE: roughly as fast as std::map in C++
-
 const BRANCHING: usize = 4;
 const MAX_HEIGHT: usize = 12;
 const HEIGHT_BITS: usize = 4;
@@ -180,6 +176,7 @@ where
     /// Returns `true` if the skip list is empty.
     pub fn is_empty(&self) -> bool {
         unsafe {
+            // TODO: check if the node is marked, and iterate forward
             (*self.head).tower()[0]
                 .load(SeqCst, epoch::unprotected())
                 .is_null()
@@ -908,7 +905,20 @@ mod tests {
 
     #[test]
     fn cursor() {
-        // let insert = [0, 4, 2, 12, 8, 7, 11, 5];
-        // let mut s = SkipList::new();
+        let insert = [4, 2, 12, 8, 7, 11, 5];
+        let mut s = SkipList::new();
+        for &elt in &insert {
+            s.insert(elt, elt * 10);
+        }
+
+        let mut c = s.cursor();
+        assert!(c.is_null());
+
+        c.next();
+        assert_eq!(c.key(), Some(&2));
+        c.prev();
+        assert!(c.is_null());
+        c.prev();
+        assert_eq!(c.key(), Some(12));
     }
 }

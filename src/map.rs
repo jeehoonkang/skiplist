@@ -57,7 +57,21 @@ where
         unimplemented!()
     }
 
-    pub fn insert(&self, key: K, value: V) -> Result<Cursor<K, V>, InsertError<K, V>> {
+    pub fn seek<Q>(&self, key: &Q) -> Cursor<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut cursor = self.cursor();
+        cursor.seek(key);
+        cursor
+    }
+
+    pub fn insert(&self, key: K, value: V) -> Cursor<K, V> {
+        unimplemented!()
+    }
+
+    fn get_or_insert(&self, key: K, value: V) -> Cursor<K, V> {
         unimplemented!()
     }
 
@@ -66,14 +80,6 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        unimplemented!()
-    }
-
-    pub fn pop_front(&self) -> Cursor<K, V> {
-        unimplemented!()
-    }
-
-    pub fn pop_back(&self) -> Cursor<K, V> {
         unimplemented!()
     }
 
@@ -133,16 +139,20 @@ impl<K, V> fmt::Debug for SkipListMap<K, V> {
     }
 }
 
-#[derive(Debug)]
-pub struct InsertError<'a, K, V>
-where
-    K: Send + 'static,
-    V: 'a
-{
-    pub key: K,
-    pub value: V,
-    pub cursor: Cursor<'a, K, V>,
-}
+// TODO: Cursor::set(V) where K: Clone (what if null? ignore?)
+// TODO: Cursor::replace(V) -> Option<Cursor<K, V>> where K: Clone, must be atomic (what if null? ignore? what if removed?)
+// TODO: Cursor::reload() (if it's removed, searches again)
+
+// #[derive(Debug)]
+// pub struct InsertError<'a, K, V>
+// where
+//     K: Send + 'static,
+//     V: 'a
+// {
+//     pub key: K,
+//     pub value: V,
+//     pub cursor: Cursor<'a, K, V>,
+// }
 
 pub struct Cursor<'a, K, V>
 where
