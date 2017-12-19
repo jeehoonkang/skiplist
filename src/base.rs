@@ -9,6 +9,7 @@ use epoch::{self, Atomic, Guard, Shared};
 
 // TODO: a test where comparison function sometimes panics
 // TODO: Explain why TrustedOrd is not required
+// TODO: optimize for needs_drop::<K>() (use global vs custom collector)
 
 const BRANCHING: usize = 4;
 const MAX_HEIGHT: usize = 12;
@@ -117,6 +118,22 @@ impl<K, V> Node<K, V> {
                 Err(o) => old = o,
             }
         }
+    }
+
+    fn mark_tower(&self) -> bool {
+        let height = self.height();
+
+        for level in (0..height).rev() {
+            let next = unsafe {
+                self.tower()[level].fetch_or(1, SeqCst, epoch::unprotected())
+            };
+
+            if level == 0 && next.tag() == 1 {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -307,30 +324,37 @@ where
         }
     }
 
-    pub fn insert(&self, key: K, value: V) -> Result<Cursor<K, V>, InsertError<K, V>> {
+    pub fn insert(&self, key: K, value: V, replace: bool) -> Cursor<K, V> {
         let guard = &epoch::pin();
 
         // First try searching for the key.
         // Note that the `Ord` implementation for `K` may panic during the search.
-        let mut search = self.search(Some(&key), guard);
+        let mut search;
 
-        // If a node with the key was found, let's try creating a cursor positioned to it.
-        if search.found {
+        loop {
+            search = self.search(Some(&key), guard);
+
+            if !search.found {
+                break;
+            }
+
+            // If a node with the key was found and we're not going to replace it, let's try creating a
+            // cursor positioned to it.
             let r = search.right[0];
 
-            unsafe {
-                // Try incrementing its reference count.
-                if Node::increment(r.as_raw()) {
-                    // Success!
-                    return Err(InsertError {
-                        key,
-                        value,
-                        cursor: Cursor::new(self, r.deref()),
-                    });
+            if replace {
+                unsafe { r.deref().mark_tower(); }
+            } else {
+                unsafe {
+                    // Try incrementing its reference count.
+                    if Node::increment(r.as_raw()) {
+                        // Success!
+                        return Cursor::new(self, r.deref());
+                    }
+                    // If we couldn't increment the reference count, that means that someone has just
+                    // deleted the node.
+                    break;
                 }
-
-                // If we couldn't increment the reference count, that means that someone has just
-                // deleted the node.
             }
         }
 
@@ -343,7 +367,7 @@ where
             ptr::write(&mut (*n).key, key);
             ptr::write(&mut (*n).value, value);
 
-            // Increment the reference count twice to account for:
+            // The reference count is initially zero. Let's increment it twice to account for:
             // 1. The cursor that will be returned.
             // 2. The link at the level 0 of the tower.
             (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, AcqRel);
@@ -376,28 +400,27 @@ where
                 self.search(Some(&n.key), guard)
             };
 
-            // Have we found a node with the key this time?
+            // If a node with the key was found and we're not going to replace it, let's try
+            // creating a cursor positioned to it.
             if search.found {
                 let r = search.right[0];
 
-                unsafe {
-                    // Try incrementing its reference count.
-                    if Node::increment(r.as_raw()) {
-                        // Success! Let's deallocate the new node and return an `InsertError`.
-                        let key = ptr::read(&n.key);
-                        let value = ptr::read(&n.value);
-
-                        Node::dealloc(node.as_raw() as *mut Node<K, V>);
-
-                        return Err(InsertError {
-                            key,
-                            value,
-                            cursor: Cursor::new(self, r.deref()),
-                        });
+                if replace {
+                    unsafe { r.deref().mark_tower(); }
+                } else {
+                    unsafe {
+                        // Try incrementing its reference count.
+                        if Node::increment(r.as_raw()) {
+                            // Success! Let's deallocate the new node and return a cursor positioned to
+                            // the existing one.
+                            let key = ptr::read(&n.key);
+                            let value = ptr::read(&n.value);
+                            Node::dealloc(node.as_raw() as *mut Node<K, V>);
+                            return Cursor::new(self, r.deref());
+                        }
+                        // If we couldn't increment the reference count, that means that someone has
+                        // just deleted the node.
                     }
-
-                    // If we couldn't increment the reference count, that means that someone has
-                    // just deleted the node.
                 }
             }
         }
@@ -488,7 +511,7 @@ where
             self.search(Some(&n.key), guard);
         }
 
-        Ok(cursor)
+        cursor
     }
 
     pub fn get<Q>(&self, key: &Q) -> Cursor<K, V>
@@ -527,19 +550,14 @@ where
 
         let node = search.right[0];
         let n = unsafe { node.deref() };
-        let height = n.height();
 
-        for level in (0..height).rev() {
-            let next = n.tower()[level].fetch_or(1, SeqCst, guard);
-
-            if level == 0 && next.tag() == 1 {
-                return self.cursor();
-            }
+        if !n.mark_tower() {
+            return self.cursor();
         }
 
         let cursor = Cursor::new(self, n as *const _ as *mut _);
 
-        for level in (0..height).rev() {
+        for level in (0..n.height()).rev() {
             let succ = n.tower()[level].load(SeqCst, guard).with_tag(0);
 
             if search.left[level].tower()[level]
@@ -595,16 +613,6 @@ struct Search<'g, K: 'g, V: 'g> {
 
     /// Adjacent nodes with equal or greater keys.
     right: [Shared<'g, Node<K, V>>; MAX_HEIGHT],
-}
-
-pub struct InsertError<'a, K, V>
-where
-    K: Send + 'static,
-    V: 'a
-{
-    pub key: K,
-    pub value: V,
-    pub cursor: Cursor<'a, K, V>,
 }
 
 pub struct Cursor<'a, K, V>
@@ -780,25 +788,19 @@ where
 
     /// Removes the element this cursor is positioned to.
     ///
-    /// Returns `true` if this call removed the element and `false` if it was already removed.
+    /// Returns `true` if this call removed the element.
+    ///
+    /// Returns `false` if the element was already removed or if the cursor is positioned to null.
     pub fn remove(&self) -> bool {
         if let Some(n) = unsafe { self.node.as_ref() } {
-            let guard = &epoch::pin();
-            let height = n.height();
-
-            for level in (0..height).rev() {
-                let next = n.tower()[level].fetch_or(1, SeqCst, guard);
-
-                if level == 0 && next.tag() == 1 {
-                    return false;
-                }
+            if n.mark_tower() {
+                let guard = &epoch::pin();
+                self.parent.search(Some(&n.key), guard);
+                return true;
             }
-
-            self.parent.search(Some(&n.key), guard);
-            true
-        } else {
-            false
         }
+
+        false
     }
 }
 
@@ -833,10 +835,10 @@ mod tests {
         let mut s = SkipList::new();
         assert!(s.is_empty());
 
-        s.insert(1, 10);
+        s.insert(1, 10, false);
         assert!(!s.is_empty());
-        s.insert(2, 20);
-        s.insert(3, 30);
+        s.insert(2, 20, false);
+        s.insert(3, 30, false);
         assert!(!s.is_empty());
 
         s.remove(&2);
@@ -856,7 +858,7 @@ mod tests {
         let mut s = SkipList::new();
 
         for &elt in &insert {
-            assert!(s.insert(elt, elt * 10).is_ok());
+            s.insert(elt, elt * 10, false);
             assert_eq!(s.get(&elt).value(), Some(&(elt * 10)));
         }
 
@@ -874,7 +876,7 @@ mod tests {
         let mut s = SkipList::new();
 
         for &elt in &insert {
-            assert!(s.insert(elt, elt * 10).is_ok());
+            s.insert(elt, elt * 10, false);
         }
 
         for elt in &not_present {
@@ -908,7 +910,7 @@ mod tests {
         let insert = [4, 2, 12, 8, 7, 11, 5];
         let mut s = SkipList::new();
         for &elt in &insert {
-            s.insert(elt, elt * 10);
+            s.insert(elt, elt * 10, false);
         }
 
         let mut c = s.cursor();
@@ -919,6 +921,6 @@ mod tests {
         c.prev();
         assert!(c.is_null());
         c.prev();
-        assert_eq!(c.key(), Some(12));
+        assert_eq!(c.key(), Some(&12));
     }
 }

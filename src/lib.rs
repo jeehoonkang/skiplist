@@ -3,8 +3,10 @@ extern crate crossbeam_epoch as epoch;
 extern crate scopeguard;
 
 pub mod map;
-mod skiplist;
+mod base;
 
-pub use map::SkipListMap;
+// TODO: pub mod queue; // SkipQueue
+
+pub use map::SkipMap;
 
 // TODO: Heap, impl as SkipListMap<K, ManuallyDrop<V>>

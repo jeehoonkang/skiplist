@@ -1,19 +1,19 @@
 use std::borrow::Borrow;
 use std::fmt;
 
-use skiplist::{self, SkipList};
+use base;
 
-pub struct SkipListMap<K, V> {
-    inner: SkipList<K, V>,
+pub struct SkipMap<K, V> {
+    inner: base::SkipList<K, V>,
 }
 
-impl<K, V> SkipListMap<K, V>
+impl<K, V> SkipMap<K, V>
 where
     K: Ord + Send + 'static,
 {
-    pub fn new() -> SkipListMap<K, V> {
-        SkipListMap {
-            inner: SkipList::new(),
+    pub fn new() -> SkipMap<K, V> {
+        SkipMap {
+            inner: base::SkipList::new(),
         }
     }
 
@@ -22,11 +22,13 @@ where
     }
 
     pub fn count(&self) -> usize {
-        unimplemented!()
+        self.inner.count()
     }
 
     pub fn cursor(&self) -> Cursor<K, V> {
-        unimplemented!()
+        Cursor {
+            inner: self.inner.cursor(),
+        }
     }
 
     pub fn front(&self) -> Cursor<K, V> {
@@ -54,7 +56,9 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        unimplemented!()
+        Cursor {
+            inner: self.inner.get(key),
+        }
     }
 
     pub fn seek<Q>(&self, key: &Q) -> Cursor<K, V>
@@ -80,18 +84,34 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        unimplemented!()
+        Cursor {
+            inner: self.inner.remove(key),
+        }
     }
 
     pub fn clear(&self) {
-        unimplemented!()
+        let mut cursor = self.cursor();
+        cursor.next();
+
+        while !cursor.is_null() {
+            cursor.remove();
+            cursor.next();
+        }
     }
 
-    pub fn retain<F>(&mut self, f: F)
+    pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&K, &V) -> bool,
     {
-        unimplemented!()
+        let mut cursor = self.cursor();
+        cursor.next();
+
+        while !cursor.is_null() {
+            if f(cursor.key().unwrap(), cursor.value().unwrap()) {
+                cursor.remove();
+            }
+            cursor.next();
+        }
     }
 
     pub fn keys(&self) {
@@ -133,9 +153,9 @@ where
     // TODO: impl Default
 }
 
-impl<K, V> fmt::Debug for SkipListMap<K, V> {
+impl<K, V> fmt::Debug for SkipMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("SkipListMap").finish()
+        f.debug_struct("SkipMap").finish()
     }
 }
 
@@ -143,23 +163,12 @@ impl<K, V> fmt::Debug for SkipListMap<K, V> {
 // TODO: Cursor::replace(V) -> Option<Cursor<K, V>> where K: Clone, must be atomic (what if null? ignore? what if removed?)
 // TODO: Cursor::reload() (if it's removed, searches again)
 
-// #[derive(Debug)]
-// pub struct InsertError<'a, K, V>
-// where
-//     K: Send + 'static,
-//     V: 'a
-// {
-//     pub key: K,
-//     pub value: V,
-//     pub cursor: Cursor<'a, K, V>,
-// }
-
 pub struct Cursor<'a, K, V>
 where
     K: Send + 'static,
     V: 'a,
 {
-    inner: skiplist::Cursor<'a, K, V>,
+    inner: base::Cursor<'a, K, V>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Cursor<'a, K, V> {}
