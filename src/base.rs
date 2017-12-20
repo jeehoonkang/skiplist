@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::mem;
 use std::ptr;
 use std::slice;
@@ -6,10 +7,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
 
 use epoch::{self, Atomic, Guard, Shared};
-
-// TODO: a test where comparison function sometimes panics
-// TODO: Explain why TrustedOrd is not required
-// TODO: optimize for needs_drop::<K>() (use global vs custom collector)
 
 const BRANCHING: usize = 4;
 const MAX_HEIGHT: usize = 12;
@@ -120,13 +117,13 @@ impl<K, V> Node<K, V> {
         }
     }
 
+    /// Marks all pointers in the tower and returns `true` if the level 0 wasn't already marked.
     fn mark_tower(&self) -> bool {
         let height = self.height();
 
         for level in (0..height).rev() {
-            let next = unsafe {
-                self.tower()[level].fetch_or(1, SeqCst, epoch::unprotected())
-            };
+            let next =
+                unsafe { self.tower()[level].fetch_or(1, SeqCst, epoch::unprotected()) };
 
             if level == 0 && next.tag() == 1 {
                 return false;
@@ -134,6 +131,10 @@ impl<K, V> Node<K, V> {
         }
 
         true
+    }
+
+    fn is_removed(&self) -> bool {
+        unsafe { self.tower()[0].load(SeqCst, epoch::unprotected()).tag() == 1 }
     }
 }
 
@@ -173,15 +174,14 @@ impl<K: Send + 'static, V> Node<K, V> {
 pub struct SkipList<K, V> {
     head: *const Node<K, V>, // !Send + !Sync
     seed: AtomicUsize,
+    // TODO: Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`, create a
+    // custom collector, otherwise use the default one. Then we can remove the `K: 'static` bound.
 }
 
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for SkipList<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipList<K, V> {}
 
-impl<K, V> SkipList<K, V>
-where
-    K: Ord + Send + 'static,
-{
+impl<K, V> SkipList<K, V> {
     /// Returns a new, empty skip list.
     pub fn new() -> SkipList<K, V> {
         SkipList {
@@ -189,27 +189,44 @@ where
             seed: AtomicUsize::new(1),
         }
     }
+}
 
+impl<K, V> SkipList<K, V>
+where
+    K: Ord + Send + 'static,
+{
     /// Returns `true` if the skip list is empty.
     pub fn is_empty(&self) -> bool {
-        unsafe {
-            // TODO: check if the node is marked, and iterate forward
+        match unsafe {
             (*self.head).tower()[0]
                 .load(SeqCst, epoch::unprotected())
-                .is_null()
+                .as_ref()
+        } {
+            None => true,
+            Some(node) => {
+                if node.is_removed() {
+                    let c = self.cursor();
+                    c.next();
+                    c.is_null()
+                } else {
+                    false
+                }
+            }
         }
     }
 
     /// Iterates over the skip list and returns the number of traversed elements.
     pub fn count(&self) -> usize {
-        let mut guard = epoch::pin();
+        let guard = &mut epoch::pin();
+
         let mut count = 0;
-        let mut cursor = self.cursor();
+        let cursor = self.cursor();
         cursor.next();
 
         while !cursor.is_null() {
-            cursor.next();
             count += 1;
+            cursor.next();
+
             if count % 128 == 0 {
                 guard.repin();
             }
@@ -218,6 +235,7 @@ where
         count
     }
 
+    /// Returns a new cursor positioned to null.
     pub fn cursor(&self) -> Cursor<K, V> {
         Cursor::new(self, ptr::null())
     }
@@ -343,7 +361,9 @@ where
             let r = search.right[0];
 
             if replace {
-                unsafe { r.deref().mark_tower(); }
+                unsafe {
+                    r.deref().mark_tower();
+                }
             } else {
                 unsafe {
                     // Try incrementing its reference count.
@@ -406,20 +426,24 @@ where
                 let r = search.right[0];
 
                 if replace {
-                    unsafe { r.deref().mark_tower(); }
+                    unsafe {
+                        r.deref().mark_tower();
+                    }
                 } else {
                     unsafe {
                         // Try incrementing its reference count.
                         if Node::increment(r.as_raw()) {
-                            // Success! Let's deallocate the new node and return a cursor positioned to
-                            // the existing one.
-                            let key = ptr::read(&n.key);
-                            let value = ptr::read(&n.value);
-                            Node::dealloc(node.as_raw() as *mut Node<K, V>);
+                            // Success! Let's deallocate the new node and return a cursor
+                            // positioned to the existing one.
+                            let raw = node.as_raw() as *mut Node<K, V>;
+                            ptr::drop_in_place(&mut (*raw).key);
+                            ptr::drop_in_place(&mut (*raw).value);
+                            Node::dealloc(raw);
+
                             return Cursor::new(self, r.deref());
                         }
-                        // If we couldn't increment the reference count, that means that someone has
-                        // just deleted the node.
+                        // If we couldn't increment the reference count, that means that someone
+                        // has just deleted the node.
                     }
                 }
             }
@@ -577,6 +601,29 @@ where
 
         cursor
     }
+
+    pub fn clear(&self) {
+        let guard = &mut epoch::pin();
+
+        let mut count = 0;
+        let mut cursor = self.cursor();
+        cursor.next();
+
+        while !cursor.is_null() {
+            count += 1;
+
+            let c = cursor.clone();
+            c.next();
+            unsafe { (*cursor.node.get()).mark_tower() };
+            cursor = c;
+
+            if count % 128 == 0 {
+                guard.repin();
+            }
+        }
+
+        self.search(None, guard);
+    }
 }
 
 impl<K, V> Drop for SkipList<K, V> {
@@ -593,6 +640,25 @@ impl<K, V> Drop for SkipList<K, V> {
                 let next = (*node).tower()[0].load(Relaxed, epoch::unprotected());
                 Node::dealloc(node);
                 node = next.as_raw() as *mut Node<K, V>;
+            }
+        }
+    }
+}
+
+impl<K, V> IntoIterator for SkipList<K, V> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(self) -> IntoIter<K, V> {
+        unsafe {
+            let next = (*self.head).tower()[0].load(Relaxed, epoch::unprotected()).as_raw();
+
+            for level in 0..MAX_HEIGHT {
+                (*self.head).tower()[level].store(Shared::null(), Relaxed);
+            }
+
+            IntoIter {
+                node: next as *mut Node<K, V>,
             }
         }
     }
@@ -621,7 +687,7 @@ where
     V: 'a,
 {
     parent: &'a SkipList<K, V>,
-    node: *const Node<K, V>,
+    node: Cell<*const Node<K, V>>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Cursor<'a, K, V> {}
@@ -634,38 +700,33 @@ where
     fn new(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
         Cursor {
             parent: parent,
-            node: node,
+            node: Cell::new(node),
         }
     }
 
     /// Returns `true` if the cursor is positioned to null.
     pub fn is_null(&self) -> bool {
-        self.node.is_null()
+        self.node.get().is_null()
     }
 
     /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
     pub fn is_valid(&self) -> bool {
-        unsafe {
-            self.node
-                .as_ref()
-                .map(|r| r.tower()[0].load(SeqCst, epoch::unprotected()).tag() == 0)
-                .unwrap_or(false)
-        }
+        unsafe { self.node.get().as_ref().map(|r| !r.is_removed()).unwrap_or(false) }
     }
 
-    /// Returns the key of the element pointed to by the cursor.
+    /// Returns the key of the current element.
     pub fn key(&self) -> Option<&K> {
-        unsafe { self.node.as_ref().map(|r| &r.key) }
+        unsafe { self.node.get().as_ref().map(|r| &r.key) }
     }
 
-    /// Returns the value of the element pointed to by the cursor.
+    /// Returns the value of the current element.
     pub fn value(&self) -> Option<&V> {
-        unsafe { self.node.as_ref().map(|r| &r.value) }
+        unsafe { self.node.get().as_ref().map(|r| &r.value) }
     }
 
-    /// Returns a reference to the skip list owning this cursor.
-    pub fn parent(&self) -> &SkipList<K, V> {
-        self.parent
+    /// Returns the key-value pair of the current element.
+    pub fn key_and_value(&self) -> Option<(&K, &V)> {
+        unsafe { self.node.get().as_ref().map(|r| (&r.key, &r.value)) }
     }
 }
 
@@ -673,13 +734,12 @@ impl<'a, K, V> Cursor<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    // TODO: what happens if this one is removed and there is a new element with the same key?
     /// Moves the cursor to the next element in the skip list.
     ///
-    /// If the current element is the last one in the skiplist, the cursor becomes null.
-    pub fn next(&mut self) {
+    /// If the current element is the last one in the skiplist, the cursor is positioned to null.
+    pub fn next(&self) {
         let guard = &epoch::pin();
-        let node_ref = unsafe { self.node.as_ref() };
+        let node_ref = unsafe { self.node.get().as_ref() };
 
         loop {
             let ptr = match node_ref {
@@ -706,7 +766,7 @@ where
                 let success = unsafe {
                     match ptr.as_ref() {
                         None => true,
-                        Some(c) => Node::increment(c),
+                        Some(c) => !c.is_removed() && Node::increment(c),
                     }
                 };
 
@@ -716,18 +776,17 @@ where
                             Node::decrement(node);
                         }
                     }
-                    self.node = ptr.as_raw();
+                    self.node.set(ptr.as_raw());
                     return;
                 }
             }
         }
     }
 
-    // TODO: what happens if this one is removed and there is a new element with the same key?
     /// Moves the cursor to the previous element in the skip list.
     ///
-    /// If the current element is the first one in the skiplist, the cursor becomes null.
-    pub fn prev(&mut self) {
+    /// If the current element is the first one in the skiplist, the cursor is positioned to null.
+    pub fn prev(&self) {
         let guard = &epoch::pin();
 
         loop {
@@ -736,14 +795,14 @@ where
 
             unsafe {
                 if ptr::eq(pred, self.parent.head) {
-                    Node::decrement(self.node);
-                    self.node = ptr::null();
+                    Node::decrement(self.node.get());
+                    self.node.set(ptr::null());
                     break;
                 }
 
                 if Node::increment(pred) {
-                    Node::decrement(self.node);
-                    self.node = pred;
+                    Node::decrement(self.node.get());
+                    self.node.set(pred);
                     break;
                 }
             }
@@ -751,7 +810,9 @@ where
     }
 
     /// Positions the cursor to the first element with key equal to or greater than `key`.
-    pub fn seek<Q>(&mut self, key: &Q) -> bool
+    ///
+    /// Returns `true` if an element with `key` is found.
+    pub fn seek<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -764,8 +825,8 @@ where
 
             unsafe {
                 if Node::increment(node) {
-                    Node::decrement(self.node);
-                    self.node = node;
+                    Node::decrement(self.node.get());
+                    self.node.set(node);
                     return search.found;
                 }
             }
@@ -773,17 +834,34 @@ where
     }
 
     /// Positions the cursor to the first element in the skip list, if it exists.
-    pub fn seek_to_front(&mut self) -> bool {
-        *self = self.parent.cursor();
+    pub fn seek_to_front(&self) -> bool {
+        self.node.swap(&self.parent.cursor().node);
         self.next();
         !self.is_null()
     }
 
     /// Positions the cursor to the last element in the skip list, if it exists.
-    pub fn seek_to_back(&mut self) -> bool {
-        *self = self.parent.cursor();
+    pub fn seek_to_back(&self) -> bool {
+        self.node.swap(&self.parent.cursor().node);
         self.prev();
         !self.is_null()
+    }
+
+    /// If the current element is removed, seeks for its key to reposition the cursor.
+    ///
+    /// Returns `true` if the cursor didn't need repositioning or if the key didn't change after
+    /// repositioning.
+    ///
+    /// Otherwise, `false` is returned and the cursor is positioned to the first element with a
+    /// greater key. If no element with a greater key exists, then the cursor is positioned to
+    /// null.
+    pub fn reseek(&self) -> bool {
+        if self.is_null() || self.is_valid() {
+            true
+        } else {
+            let c = self.clone();
+            self.seek(c.key().unwrap())
+        }
     }
 
     /// Removes the element this cursor is positioned to.
@@ -792,7 +870,7 @@ where
     ///
     /// Returns `false` if the element was already removed or if the cursor is positioned to null.
     pub fn remove(&self) -> bool {
-        if let Some(n) = unsafe { self.node.as_ref() } {
+        if let Some(n) = unsafe { self.node.get().as_ref() } {
             if n.mark_tower() {
                 let guard = &epoch::pin();
                 self.parent.search(Some(&n.key), guard);
@@ -809,8 +887,49 @@ where
     K: Send + 'static,
 {
     fn drop(&mut self) {
-        if !self.node.is_null() {
-            unsafe { Node::decrement(self.node) }
+        if !self.node.get().is_null() {
+            unsafe { Node::decrement(self.node.get()) }
+        }
+    }
+}
+
+impl<'a, K, V> Clone for Cursor<'a, K, V>
+where
+    K: Send + 'static,
+{
+    fn clone(&self) -> Cursor<'a, K, V> {
+        unsafe {
+            Node::increment(self.node.get());
+        }
+        Cursor {
+            parent: self.parent,
+            node: self.node.clone(),
+        }
+    }
+}
+
+pub struct IntoIter<K, V> {
+    node: *mut Node<K, V>,
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<(K, V)> {
+        loop {
+            if self.node.is_null() {
+                return None;
+            }
+
+            let key = unsafe { ptr::read(&mut (*self.node).key) };
+            let value = unsafe { ptr::read(&mut (*self.node).value) };
+
+            let next = unsafe { (*self.node).tower()[0].load(Relaxed, epoch::unprotected()) };
+            self.node = next.as_raw() as *mut Node<K, V>;
+
+            if next.tag() == 0 {
+                return Some((key, value));
+            }
         }
     }
 }
@@ -824,6 +943,10 @@ mod tests {
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     use std::ptr;
 
+    // TODO: random panics
+    // TODO: stress test
+    // TODO: https://github.com/dmlloyd/openjdk/blob/jdk/jdk/test/jdk/java/util/concurrent/tck/ConcurrentSkipListMapTest.java
+
     #[test]
     fn new() {
         SkipList::<i32, i32>::new();
@@ -832,7 +955,7 @@ mod tests {
 
     #[test]
     fn is_empty() {
-        let mut s = SkipList::new();
+        let s = SkipList::new();
         assert!(s.is_empty());
 
         s.insert(1, 10, false);
@@ -855,7 +978,7 @@ mod tests {
     fn insert() {
         let insert = [0, 4, 2, 12, 8, 7, 11, 5];
         let not_present = [1, 3, 6, 9, 10];
-        let mut s = SkipList::new();
+        let s = SkipList::new();
 
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
@@ -873,7 +996,7 @@ mod tests {
         let not_present = [1, 3, 6, 9, 10];
         let remove = [2, 12, 8];
 
-        let mut s = SkipList::new();
+        let s = SkipList::new();
 
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
@@ -887,7 +1010,7 @@ mod tests {
             assert!(!s.remove(elt).is_null());
         }
 
-        let mut c = s.cursor();
+        let c = s.cursor();
         c.next();
         let mut v = vec![];
 
@@ -908,12 +1031,12 @@ mod tests {
     #[test]
     fn cursor() {
         let insert = [4, 2, 12, 8, 7, 11, 5];
-        let mut s = SkipList::new();
+        let s = SkipList::new();
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
         }
 
-        let mut c = s.cursor();
+        let c = s.cursor();
         assert!(c.is_null());
 
         c.next();
@@ -922,5 +1045,109 @@ mod tests {
         assert!(c.is_null());
         c.prev();
         assert_eq!(c.key(), Some(&12));
+        c.prev();
+        assert_eq!(c.key(), Some(&11));
+        c.prev();
+        assert_eq!(c.key(), Some(&8));
+    }
+
+    #[test]
+    fn cursor_remove() {
+        let insert = [4, 2, 12, 8, 7, 11, 5];
+        let s = SkipList::new();
+        for &elt in &insert {
+            s.insert(elt, elt * 10, false);
+        }
+
+        let c = s.cursor();
+        c.seek(&7);
+        assert!(c.is_valid());
+        c.remove();
+        assert!(!c.is_valid());
+
+        c.prev();
+        c.next();
+        assert_ne!(c.key(), Some(&7));
+    }
+
+    #[test]
+    fn cursor_reposition() {
+        let insert = [4, 2, 12, 8, 7, 11, 5];
+        let s = SkipList::new();
+        for &elt in &insert {
+            s.insert(elt, elt * 10, false);
+        }
+
+        let c = s.cursor();
+        c.seek(&7);
+        let c2 = c.clone();
+        c.remove();
+
+        s.insert(7, 0, false);
+        c.prev();
+        c2.next();
+        assert_eq!(c.key(), Some(&5));
+        assert_eq!(c2.key(), Some(&8));
+
+        c.next();
+        c2.prev();
+        assert_eq!(c.key(), Some(&7));
+        assert_eq!(c.value(), Some(&0));
+        assert_eq!(c2.key(), Some(&7));
+        assert_eq!(c2.value(), Some(&0));
+    }
+
+    #[test]
+    fn seek() {
+        let insert = [4, 2, 12, 8, 7, 11, 5];
+        let s = SkipList::new();
+        for &elt in &insert {
+            s.insert(elt, elt * 10, false);
+        }
+
+        let c = s.cursor();
+
+        c.seek(&0);
+        assert_eq!(c.key(), Some(&2));
+
+        c.seek(&15);
+        assert_eq!(c.key(), None);
+
+        c.seek(&7);
+        assert_eq!(c.key(), Some(&7));
+        assert_eq!(c.value(), Some(&70));
+
+        c.seek(&6);
+        assert_eq!(c.key(), Some(&7));
+
+        c.seek_to_front();
+        assert_eq!(c.key(), Some(&2));
+
+        c.seek_to_back();
+        assert_eq!(c.key(), Some(&12));
+    }
+
+    #[test]
+    fn count() {
+        let insert = [4, 2, 12, 8, 7, 11, 5];
+        let s = SkipList::new();
+        assert_eq!(s.count(), 0);
+
+        for (index, &elt) in insert.iter().enumerate() {
+            s.insert(elt, elt * 10, false);
+            assert_eq!(s.count(), index + 1);
+        }
+
+        s.insert(5, 0, false);
+        assert_eq!(s.count(), 7);
+        s.insert(5, 0, true);
+        assert_eq!(s.count(), 7);
+
+        s.remove(&6);
+        assert_eq!(s.count(), 7);
+        s.remove(&5);
+        assert_eq!(s.count(), 6);
+        s.remove(&12);
+        assert_eq!(s.count(), 5);
     }
 }
