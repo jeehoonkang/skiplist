@@ -164,11 +164,10 @@ where
     //     unimplemented!()
     // }
 
-    // TODO(stjepang): When streaming iterators become possible, add:
-    // 1. `fn iter(&self) -> Iter<K, V>`.
-    // 2. `fn keys(&self) -> Keys<K>`.
-    // 3. `fn values(&self) -> Values<V>`.
-    // 4. `fn range<Q, R>(&self, range: R) -> Range<K, V> where ...`.
+    // TODO:
+    // 1. `fn iter(&self) -> Iter<K, V>` -> Entry<'a, K, V> -> deref to (&'a K, &'a V).
+    // 4. `fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` -> Entry<'a, K, V> (double
+    //    ended iterator).
 }
 
 impl<K, V> Default for SkipMap<K, V> {
@@ -188,7 +187,7 @@ impl<K, V> IntoIterator for SkipMap<K, V> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
-    fn into_iter(self) -> IntoIter<K,V> {
+    fn into_iter(self) -> IntoIter<K, V> {
         IntoIter {
             inner: self.inner.into_iter(),
         }
@@ -284,6 +283,11 @@ where
         self.inner.seek_to_back()
     }
 
+    pub fn seek_to_null(&self) {
+        // TODO
+        unimplemented!()
+    }
+
     /// If the current element is removed, seeks for its key to reposition the cursor.
     ///
     /// Returns `true` if the cursor didn't need repositioning or if the key didn't change after
@@ -296,20 +300,25 @@ where
         self.inner.reseek()
     }
 
-    pub fn set(&self, value: V)
+    /// Inserts a new key-value pair into the map.
+    ///
+    /// The cursor will be positioned to the new pair and the old one
+    /// If there is an existing pair with this key, it will be removed before inserting the new
+    /// pair. The returned cursor will be positioned to the new pair.
+    pub fn insert(&self, value: V) -> Cursor<K, V>
     where
         K: Clone,
     {
-        // TODO
-        unimplemented!()
-    }
-
-    pub fn replace(&self, value: V) -> Cursor<K, V>
-    where
-        K: Clone,
-    {
-        // TODO: Cursor::replace(V) -> Option<Cursor<K, V>> where K: Clone, must be atomic (what if null? ignore? what if removed?)
-        unimplemented!()
+        match self.key() {
+            None => self.clone(),
+            Some(k) => {
+                let c = self.inner.parent.insert(k.clone(), value, true);
+                self.inner.node.swap(&c.node);
+                Cursor {
+                    inner: c,
+                }
+            }
+        }
     }
 
     /// Removes the element this cursor is positioned to.
@@ -368,6 +377,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-
-}
+mod tests {}

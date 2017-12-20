@@ -20,7 +20,7 @@ const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
 /// reference count, and height are kept close to the tower to improve cache locality during
 /// skip list traversal.
 #[repr(C)]
-struct Node<K, V> {
+pub struct Node<K, V> {
     /// The value.
     value: V,
 
@@ -651,7 +651,9 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 
     fn into_iter(self) -> IntoIter<K, V> {
         unsafe {
-            let next = (*self.head).tower()[0].load(Relaxed, epoch::unprotected()).as_raw();
+            let next = (*self.head).tower()[0]
+                .load(Relaxed, epoch::unprotected())
+                .as_raw();
 
             for level in 0..MAX_HEIGHT {
                 (*self.head).tower()[level].store(Shared::null(), Relaxed);
@@ -686,8 +688,8 @@ where
     K: Send + 'static,
     V: 'a,
 {
-    parent: &'a SkipList<K, V>,
-    node: Cell<*const Node<K, V>>,
+    pub parent: &'a SkipList<K, V>,
+    pub node: Cell<*const Node<K, V>>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Cursor<'a, K, V> {}
@@ -711,7 +713,13 @@ where
 
     /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
     pub fn is_valid(&self) -> bool {
-        unsafe { self.node.get().as_ref().map(|r| !r.is_removed()).unwrap_or(false) }
+        unsafe {
+            self.node
+                .get()
+                .as_ref()
+                .map(|r| !r.is_removed())
+                .unwrap_or(false)
+        }
     }
 
     /// Returns the key of the current element.
@@ -924,7 +932,8 @@ impl<K, V> Iterator for IntoIter<K, V> {
             let key = unsafe { ptr::read(&mut (*self.node).key) };
             let value = unsafe { ptr::read(&mut (*self.node).value) };
 
-            let next = unsafe { (*self.node).tower()[0].load(Relaxed, epoch::unprotected()) };
+            let next =
+                unsafe { (*self.node).tower()[0].load(Relaxed, epoch::unprotected()) };
             self.node = next.as_raw() as *mut Node<K, V>;
 
             if next.tag() == 0 {
