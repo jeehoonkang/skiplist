@@ -4,6 +4,8 @@ use std::iter::FromIterator;
 
 use base;
 
+// TODO: len()
+
 pub struct SkipMap<K, V> {
     inner: base::SkipList<K, V>,
 }
@@ -26,34 +28,33 @@ where
         self.inner.is_empty()
     }
 
-    /// Iterates over the skip list and returns the number of traversed elements.
+    /// Iterates over the map and returns the number of traversed elements.
     pub fn count(&self) -> usize {
         self.inner.count()
     }
 
-    /// Returns a cursor positioned to null.
-    pub fn cursor(&self) -> Cursor<K, V> {
-        Cursor {
-            inner: self.inner.cursor(),
+    /// Returns the entry with the smallest key.
+    pub fn front(&self) -> Option<Entry<K, V>> {
+        let c = self.inner.cursor();
+        c.seek_to_front();
+
+        if c.is_null() {
+            None
+        } else {
+            Some(Entry { inner: c })
         }
     }
 
-    /// Returns a cursor positioned to the first element in the map.
-    ///
-    /// If the map is empty, the cursor will be positioned to null.
-    pub fn front(&self) -> Cursor<K, V> {
-        let cursor = self.cursor();
-        cursor.seek_to_front();
-        cursor
-    }
+    /// Returns the entry with the largest key.
+    pub fn back(&self) -> Option<Entry<K, V>> {
+        let c = self.inner.cursor();
+        c.seek_to_back();
 
-    /// Returns a cursor positioned to the last element in the map.
-    ///
-    /// If the map is empty, the cursor will be positioned to null.
-    pub fn back(&self) -> Cursor<K, V> {
-        let cursor = self.cursor();
-        cursor.seek_to_back();
-        cursor
+        if c.is_null() {
+            None
+        } else {
+            Some(Entry { inner: c })
+        }
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -62,41 +63,31 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        !self.get(key).is_null()
+        self.get(key).is_some()
     }
 
     /// Returns a cursor positioned to the element corresponding to the key.
     ///
     /// If the such an element doesn't exist, the cursor will be positioned to null.
-    pub fn get<Q>(&self, key: &Q) -> Cursor<K, V>
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        Cursor {
-            inner: self.inner.get(key),
+        let c = self.inner.get(key);
+        if c.is_null() {
+            None
+        } else {
+            Some(Entry { inner: c })
         }
-    }
-
-    /// Seeks the first element with key equal to or greater than `key`.
-    ///
-    /// The returned cursor will be positioned to the found element, or null if the map is empty.
-    pub fn seek<Q>(&self, key: &Q) -> Cursor<K, V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let cursor = self.cursor();
-        cursor.seek(key);
-        cursor
     }
 
     /// Inserts a new key-value pair into the map.
     ///
     /// If there is an existing pair with this key, it will be removed before inserting the new
     /// pair. The returned cursor will be positioned to the new pair.
-    pub fn insert(&self, key: K, value: V) -> Cursor<K, V> {
-        Cursor {
+    pub fn insert(&self, key: K, value: V) -> Entry<K, V> {
+        Entry {
             inner: self.inner.insert(key, value, true),
         }
     }
@@ -106,8 +97,8 @@ where
     ///
     /// The returned cursor will be positioned to the found element, or the new one if it was
     /// inserted.
-    fn get_or_insert(&self, key: K, value: V) -> Cursor<K, V> {
-        Cursor {
+    pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
+        Entry {
             inner: self.inner.insert(key, value, false),
         }
     }
@@ -116,13 +107,17 @@ where
     ///
     /// If no element with the specified key exists, the returned cursor will be positioned to
     /// null.
-    pub fn remove<Q>(&self, key: &Q) -> Cursor<K, V>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        Cursor {
-            inner: self.inner.remove(key),
+        let c = self.inner.remove(key);
+
+        if c.is_null() {
+            None
+        } else {
+            Some(Entry { inner: c })
         }
     }
 
@@ -131,43 +126,17 @@ where
         self.inner.clear();
     }
 
-    /// Retains only the elements for which the predicate function returns `true`.
-    ///
-    /// In other words, remove all pairs `(k, v)` such that `f(&k, &v)` returns `false`.
-    pub fn retain<F>(&self, mut f: F)
-    where
-        F: FnMut(&K, &V) -> bool,
-    {
-        let cursor = self.cursor();
-        cursor.next();
-
-        loop {
-            match cursor.key_and_value() {
-                None => break,
-                Some((k, v)) => {
-                    if f(k, v) {
-                        cursor.remove();
-                    }
-                }
-            }
-            cursor.next();
+    /// TODO
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter {
+            parent: self,
+            entry: None,
+            finished: false,
         }
     }
 
     // TODO:
-    // pub fn drain<Q, R>(&self, range: R) -> Drain<K, V>
-    // where
-    //     K: Borrow<Q>,
-    //     Q: Ord + ?Sized,
-    //     R: RangeArgument<Q>,
-    // {
-    //     unimplemented!()
-    // }
-
-    // TODO:
-    // 1. `fn iter(&self) -> Iter<K, V>` -> Entry<'a, K, V> -> deref to (&'a K, &'a V).
-    // 4. `fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` -> Entry<'a, K, V> (double
-    //    ended iterator).
+    // `pub fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` -> Entry<'a, K, V> (double ended iterator).
 }
 
 impl<K, V> Default for SkipMap<K, V> {
@@ -194,6 +163,18 @@ impl<K, V> IntoIterator for SkipMap<K, V> {
     }
 }
 
+impl<'a, K, V> IntoIterator for &'a SkipMap<K, V>
+where
+    K: Ord + Send + 'static,
+{
+    type Item = Entry<'a, K, V>;
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Iter<'a, K, V> {
+        self.iter()
+    }
+}
+
 impl<K, V> FromIterator<(K, V)> for SkipMap<K, V>
 where
     K: Ord + Send + 'static,
@@ -207,7 +188,7 @@ where
     }
 }
 
-pub struct Cursor<'a, K, V>
+pub struct Entry<'a, K, V>
 where
     K: Send + 'static,
     V: 'a,
@@ -215,110 +196,52 @@ where
     inner: base::Cursor<'a, K, V>,
 }
 
-unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Cursor<'a, K, V> {}
-unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Cursor<'a, K, V> {}
+unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
+unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
-impl<'a, K, V> Cursor<'a, K, V>
+// TODO: rename 'cursor' in docs
+
+impl<'a, K, V> Entry<'a, K, V>
 where
     K: Send + 'static,
 {
-    /// Returns `true` if the cursor is positioned to null.
-    pub fn is_null(&self) -> bool {
-        self.inner.is_null()
-    }
-
-    /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
-    pub fn is_valid(&self) -> bool {
-        self.inner.is_valid()
-    }
-
     /// Returns the key of the current element.
-    pub fn key(&self) -> Option<&K> {
-        self.inner.key()
+    pub fn key(&self) -> &K {
+        self.inner.key().unwrap()
     }
 
     /// Returns the value of the current element.
-    pub fn value(&self) -> Option<&V> {
-        self.inner.value()
+    pub fn value(&self) -> &V {
+        self.inner.value().unwrap()
     }
 
-    /// Returns the key-value pair of the current element.
-    pub fn key_and_value(&self) -> Option<(&K, &V)> {
-        self.inner.key_and_value()
+    /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
+    pub fn is_removed(&self) -> bool {
+        // self.inner.is_removed()
+        unimplemented!()
     }
 }
 
-impl<'a, K, V> Cursor<'a, K, V>
+impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Moves the cursor to the next element in the skip list.
-    pub fn next(&self) {
-        self.inner.next();
-    }
+    /// Moves the cursor to the next element in the map.
+    pub fn next(&self) -> Option<Entry<'a, K, V>> {
+        let c = self.inner.clone();
+        c.next();
 
-    /// Moves the cursor to the previous element in the skip list.
-    pub fn prev(&self) {
-        self.inner.prev();
-    }
-
-    /// Positions the cursor to the first element with key equal to or greater than `key`.
-    ///
-    /// Returns `true` if an element with `key` is found.
-    pub fn seek<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.inner.seek(key)
-    }
-
-    /// Positions the cursor to the first element in the skip list, if it exists.
-    pub fn seek_to_front(&self) -> bool {
-        self.inner.seek_to_front()
-    }
-
-    /// Positions the cursor to the last element in the skip list, if it exists.
-    pub fn seek_to_back(&self) -> bool {
-        self.inner.seek_to_back()
-    }
-
-    pub fn seek_to_null(&self) {
-        // TODO
-        unimplemented!()
-    }
-
-    /// If the current element is removed, seeks for its key to reposition the cursor.
-    ///
-    /// Returns `true` if the cursor didn't need repositioning or if the key didn't change after
-    /// repositioning.
-    ///
-    /// Otherwise, `false` is returned and the cursor is positioned to the first element with a
-    /// greater key. If no element with a greater key exists, then the cursor is positioned to
-    /// null.
-    pub fn reseek(&self) -> bool {
-        self.inner.reseek()
-    }
-
-    /// Inserts a new key-value pair into the map.
-    ///
-    /// The cursor will be positioned to the new pair and the old one
-    /// If there is an existing pair with this key, it will be removed before inserting the new
-    /// pair. The returned cursor will be positioned to the new pair.
-    pub fn insert(&self, value: V) -> Cursor<K, V>
-    where
-        K: Clone,
-    {
-        match self.key() {
-            None => self.clone(),
-            Some(k) => {
-                let c = self.inner.parent.insert(k.clone(), value, true);
-                self.inner.node.swap(&c.node);
-                Cursor {
-                    inner: c,
-                }
-            }
+        if c.is_null() {
+            None
+        } else {
+            Some(Entry { inner: c })
         }
+    }
+
+    /// Moves the cursor to the previous element in the map.
+    pub fn prev(&self) -> Option<Entry<'a, K, V>> {
+        // self.inner.prev();
+        unimplemented!()
     }
 
     /// Removes the element this cursor is positioned to.
@@ -329,26 +252,52 @@ where
     }
 }
 
-impl<'a, K, V> Clone for Cursor<'a, K, V>
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Clone + Ord + Send + 'static,
+{
+    /// Inserts a new key-value pair into the map. TODO
+    ///
+    /// The cursor will be positioned to the new pair and the old one
+    /// If there is an existing pair with this key, it will be removed before inserting the new
+    /// pair. The returned cursor will be positioned to the new pair.
+    pub fn replace(&self, value: V) -> Option<Entry<'a, K, V>> {
+        // match self.key() {
+        //     None => self.clone(),
+        //     Some(k) => {
+        //         let c = self.inner.parent.insert(k.clone(), value, true);
+        //         self.inner.node.swap(&c.node);
+        //         Entry {
+        //             inner: c,
+        //         }
+        //     }
+        // }
+        unimplemented!()
+    }
+}
+
+impl<'a, K, V> Clone for Entry<'a, K, V>
 where
     K: Send + 'static,
 {
-    fn clone(&self) -> Cursor<'a, K, V> {
-        Cursor {
+    fn clone(&self) -> Entry<'a, K, V> {
+        Entry {
             inner: self.inner.clone(),
         }
     }
 }
 
-impl<'a, K, V> fmt::Debug for Cursor<'a, K, V>
+// TODO: Eq, Ord for Entry?
+
+impl<'a, K, V> fmt::Debug for Entry<'a, K, V>
 where
     K: Send + fmt::Debug + 'static,
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Cursor")
-            .field("key", &self.key())
-            .field("value", &self.value())
+        f.debug_tuple("Entry")
+            .field(&self.key())
+            .field(&self.value())
             .finish()
     }
 }
@@ -376,5 +325,64 @@ where
     }
 }
 
+pub struct Iter<'a, K, V>
+where
+    K: Send + 'static,
+    V: 'a,
+{
+    parent: &'a SkipMap<K, V>,
+    entry: Option<Entry<'a, K, V>>,
+    finished: bool,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V>
+where
+    K: Ord + Send + 'static,
+    V: 'a,
+{
+    type Item = Entry<'a, K, V>;
+
+    fn next(&mut self) -> Option<Entry<'a, K, V>> {
+        if self.finished {
+            None
+        } else {
+            let e = match self.entry.as_ref() {
+                None => self.parent.front(),
+                Some(ref e) => e.next(),
+            };
+
+            self.entry = e.clone();
+            self.finished = e.is_none();
+            e
+        }
+    }
+}
+
+impl<'a, K, V> fmt::Debug for Iter<'a, K, V>
+where
+    K: Send + fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // TODO(stjepang): Iterate over all elements (see `btree_map::Iter`).
+        f.debug_struct("Iter").finish()
+    }
+}
+
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        let m = SkipMap::new();
+
+        m.insert(1, 10);
+        m.insert(5, 50);
+        m.insert(7, 70);
+
+        for e in &m {
+            println!("{:?}", e);
+        }
+    }
+}

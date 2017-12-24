@@ -5,6 +5,8 @@ extern crate scopeguard;
 pub mod map;
 mod base;
 
+// TODO: pub mod range; // RangeArgument
+
 // TODO: pub mod queue; // SkipQueue
 
 pub use map::SkipMap;
