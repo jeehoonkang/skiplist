@@ -3,10 +3,10 @@ extern crate skiplist;
 use std::sync::Arc;
 use std::thread;
 
-use skiplist::SkipListMap;
+use skiplist::SkipMap;
 
 fn main() {
-    let s = SkipListMap::new();
+    let s = SkipMap::new();
     let my = Arc::new(s);
 
     use std::time::{Duration, Instant};
@@ -52,14 +52,7 @@ fn main() {
     // println!("LEN: {}", my.count());
 
     let now = Instant::now();
-    let mut c = my.cursor();
-    c.next();
-    let mut cnt = 0;
-    while !c.is_null() {
-        cnt += 1;
-        c.next();
-    }
-    println!("cnt = {}", cnt);
+    println!("cnt = {}", my.count());
     let elapsed = now.elapsed();
     println!(
         "iteration seconds: {:.3}",
@@ -70,7 +63,7 @@ fn main() {
     my.insert(20, 0);
     my.insert(30, 0);
 
-    let mut c = my.cursor();
-    println!("{:?}", c.seek(&33));
-    println!("-> {:?}", c.key());
+    // let mut c = my.cursor();
+    // println!("{:?}", c.seek(&33));
+    // println!("-> {:?}", c.key());
 }

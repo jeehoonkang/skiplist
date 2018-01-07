@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::cell::Cell;
+use std::fmt;
 use std::mem;
 use std::ptr;
 use std::slice;
@@ -197,19 +197,26 @@ where
 {
     /// Returns `true` if the skip list is empty.
     pub fn is_empty(&self) -> bool {
-        match unsafe {
-            (*self.head).tower()[0]
-                .load(SeqCst, epoch::unprotected())
-                .as_ref()
-        } {
-            None => true,
-            Some(node) => {
-                if node.is_removed() {
-                    let c = self.cursor();
-                    c.next();
-                    c.is_null()
-                } else {
-                    false
+        if unsafe { (*self.head).tower()[0].load(SeqCst, epoch::unprotected()).is_null() } {
+            return true;
+        }
+
+        let guard = &epoch::pin();
+
+        loop {
+            unsafe {
+                let head = &*self.head;
+                let ptr = head.tower()[0].load(SeqCst, guard);
+
+                match ptr.as_ref() {
+                    None => return true,
+                    Some(n) => {
+                        if n.is_removed() {
+                            self.search(Some(&n.key), guard);
+                        } else {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -218,26 +225,63 @@ where
     /// Iterates over the skip list and returns the number of traversed elements.
     pub fn count(&self) -> usize {
         let guard = &mut epoch::pin();
-
         let mut count = 0;
-        let cursor = self.cursor();
-        cursor.next();
 
-        while !cursor.is_null() {
-            count += 1;
-            cursor.next();
+        if let Some(mut entry) = self.front() {
+            loop {
+                count += 1;
+                if count % 128 == 0 {
+                    guard.repin();
+                }
 
-            if count % 128 == 0 {
-                guard.repin();
+                if !entry.next() {
+                    break;
+                }
             }
         }
 
         count
     }
 
-    /// Returns a new cursor positioned to null.
-    pub fn cursor(&self) -> Cursor<K, V> {
-        Cursor::new(self, ptr::null())
+    /// Returns the entry with the smallest key.
+    pub fn front(&self) -> Option<Entry<K, V>> {
+        let guard = &epoch::pin();
+
+        loop {
+            unsafe {
+                let head = &*self.head;
+                let ptr = head.tower()[0].load(SeqCst, guard);
+
+                match ptr.as_ref() {
+                    None => return None,
+                    Some(n) => {
+                        if n.is_removed() {
+                            self.search(Some(&n.key), guard);
+                        } else if Node::increment(n) {
+                            return Some(Entry::new(self, n));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the entry with the largest key.
+    pub fn back(&self) -> Option<Entry<K, V>> {
+        let guard = &epoch::pin();
+
+        loop {
+            let search = self.search(None, guard);
+            let node = search.left[0];
+
+            unsafe {
+                if ptr::eq(node, self.head) {
+                    return None;
+                } else if Node::increment(node) {
+                    return Some(Entry::new(self, node));
+                }
+            }
+        }
     }
 
     /// Generates a random height and returns it.
@@ -342,7 +386,7 @@ where
         }
     }
 
-    pub fn insert(&self, key: K, value: V, replace: bool) -> Cursor<K, V> {
+    pub fn insert(&self, key: K, value: V, replace: bool) -> Entry<K, V> {
         let guard = &epoch::pin();
 
         // First try searching for the key.
@@ -356,8 +400,8 @@ where
                 break;
             }
 
-            // If a node with the key was found and we're not going to replace it, let's try creating a
-            // cursor positioned to it.
+            // If a node with the key was found and we're not going to replace it, let's try
+            // creating an entry positioned to it.
             let r = search.right[0];
 
             if replace {
@@ -369,7 +413,7 @@ where
                     // Try incrementing its reference count.
                     if Node::increment(r.as_raw()) {
                         // Success!
-                        return Cursor::new(self, r.deref());
+                        return Entry::new(self, r.deref());
                     }
                     // If we couldn't increment the reference count, that means that someone has just
                     // deleted the node.
@@ -388,9 +432,9 @@ where
             ptr::write(&mut (*n).value, value);
 
             // The reference count is initially zero. Let's increment it twice to account for:
-            // 1. The cursor that will be returned.
+            // 1. The entry that will be returned.
             // 2. The link at the level 0 of the tower.
-            (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, AcqRel);
+            (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, Relaxed);
 
             (Shared::<Node<K, V>>::from(n as *const _), &*n)
         };
@@ -421,7 +465,7 @@ where
             };
 
             // If a node with the key was found and we're not going to replace it, let's try
-            // creating a cursor positioned to it.
+            // creating an entry positioned to it.
             if search.found {
                 let r = search.right[0];
 
@@ -433,14 +477,14 @@ where
                     unsafe {
                         // Try incrementing its reference count.
                         if Node::increment(r.as_raw()) {
-                            // Success! Let's deallocate the new node and return a cursor
+                            // Success! Let's deallocate the new node and return an entry
                             // positioned to the existing one.
                             let raw = node.as_raw() as *mut Node<K, V>;
                             ptr::drop_in_place(&mut (*raw).key);
                             ptr::drop_in_place(&mut (*raw).value);
                             Node::dealloc(raw);
 
-                            return Cursor::new(self, r.deref());
+                            return Entry::new(self, r.deref());
                         }
                         // If we couldn't increment the reference count, that means that someone
                         // has just deleted the node.
@@ -449,8 +493,8 @@ where
             }
         }
 
-        // The node was successfully inserted. Let's create a cursor positioned to it.
-        let cursor = Cursor::new(self, n as *const _ as *mut _);
+        // The node was successfully inserted. Let's create an entry positioned to it.
+        let entry = Entry::new(self, n as *const _ as *mut _);
 
         // Build the rest of the tower above level 0.
         'build: for level in 1..height {
@@ -535,10 +579,10 @@ where
             self.search(Some(&n.key), guard);
         }
 
-        cursor
+        entry
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Cursor<K, V>
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -548,78 +592,83 @@ where
         loop {
             let search = self.search(Some(key), guard);
             if !search.found {
-                return self.cursor();
+                return None;
             }
 
             let node = search.right[0].as_raw();
 
             if unsafe { Node::increment(node) } {
-                return Cursor::new(self, node);
+                return Some(Entry::new(self, node));
             }
         }
     }
 
-    pub fn remove<Q>(&self, key: &Q) -> Cursor<K, V>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
         let guard = &epoch::pin();
 
-        // Try searching for the key.
-        let search = self.search(Some(key), guard);
-        if !search.found {
-            return self.cursor();
-        }
-
-        let node = search.right[0];
-        let n = unsafe { node.deref() };
-
-        if !n.mark_tower() {
-            return self.cursor();
-        }
-
-        let cursor = Cursor::new(self, n as *const _ as *mut _);
-
-        for level in (0..n.height()).rev() {
-            let succ = n.tower()[level].load(SeqCst, guard).with_tag(0);
-
-            if search.left[level].tower()[level]
-                .compare_and_set(node, succ, SeqCst, guard)
-                .is_ok()
-            {
-                if level > 0 {
-                    unsafe {
-                        Node::decrement(n);
-                    }
-                }
-            } else {
-                self.search(Some(key), guard);
-                break;
+        loop {
+            // Try searching for the key.
+            let search = self.search(Some(key), guard);
+            if !search.found {
+                return None;
             }
-        }
 
-        cursor
+            let node = search.right[0];
+            let n = unsafe { node.deref() };
+
+            if unsafe { !Node::increment(n) } {
+                continue;
+            }
+
+            let entry = Entry::new(self, n);
+
+            if !n.mark_tower() {
+                continue;
+            }
+
+            for level in (0..n.height()).rev() {
+                let succ = n.tower()[level].load(SeqCst, guard).with_tag(0);
+
+                if search.left[level].tower()[level]
+                    .compare_and_set(node, succ, SeqCst, guard)
+                    .is_ok()
+                {
+                    unsafe { Node::decrement(n); }
+                } else {
+                    self.search(Some(key), guard);
+                    break;
+                }
+            }
+
+            return Some(entry);
+        }
     }
 
     pub fn clear(&self) {
         let guard = &mut epoch::pin();
 
         let mut count = 0;
-        let mut cursor = self.cursor();
-        cursor.next();
 
-        while !cursor.is_null() {
-            count += 1;
+        if let Some(mut entry) = self.front() {
+            loop {
+                count += 1;
+                if count % 128 == 0 {
+                    guard.repin();
+                }
 
-            let c = cursor.clone();
-            c.next();
-            unsafe { (*cursor.node.get()).mark_tower() };
-            cursor = c;
+                let next = entry.get_next();
+                unsafe { (*entry.node).mark_tower() };
 
-            if count % 128 == 0 {
-                guard.repin();
+                match next {
+                    None => break,
+                    Some(e) => entry = e,
+                }
             }
+
         }
 
         self.search(None, guard);
@@ -683,236 +732,172 @@ struct Search<'g, K: 'g, V: 'g> {
     right: [Shared<'g, Node<K, V>>; MAX_HEIGHT],
 }
 
-pub struct Cursor<'a, K, V>
+pub struct Entry<'a, K, V>
 where
     K: Send + 'static,
     V: 'a,
 {
     pub parent: &'a SkipList<K, V>,
-    pub node: Cell<*const Node<K, V>>,
+    pub node: *const Node<K, V>,
 }
 
-unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Cursor<'a, K, V> {}
-unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Cursor<'a, K, V> {}
+unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
+unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
-impl<'a, K, V> Cursor<'a, K, V>
+impl<'a, K, V> Entry<'a, K, V>
 where
     K: Send + 'static,
 {
     fn new(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
-        Cursor {
-            parent: parent,
-            node: Cell::new(node),
+        Entry {
+            parent,
+            node,
         }
     }
 
-    /// Returns `true` if the cursor is positioned to null.
-    pub fn is_null(&self) -> bool {
-        self.node.get().is_null()
+    /// Returns `true` if this entry is removed from the skip list.
+    pub fn is_removed(&self) -> bool {
+        unsafe { (*self.node).is_removed() }
     }
 
-    /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
-    pub fn is_valid(&self) -> bool {
-        unsafe {
-            self.node
-                .get()
-                .as_ref()
-                .map(|r| !r.is_removed())
-                .unwrap_or(false)
-        }
+    /// Returns a reference to the key.
+    pub fn key(&self) -> &K {
+        unsafe { &(*self.node).key }
     }
 
-    /// Returns the key of the current element.
-    pub fn key(&self) -> Option<&K> {
-        unsafe { self.node.get().as_ref().map(|r| &r.key) }
-    }
-
-    /// Returns the value of the current element.
-    pub fn value(&self) -> Option<&V> {
-        unsafe { self.node.get().as_ref().map(|r| &r.value) }
-    }
-
-    /// Returns the key-value pair of the current element.
-    pub fn key_and_value(&self) -> Option<(&K, &V)> {
-        unsafe { self.node.get().as_ref().map(|r| (&r.key, &r.value)) }
+    /// Returns a reference to the value.
+    pub fn value(&self) -> &V {
+        unsafe { &(*self.node).value }
     }
 }
 
-impl<'a, K, V> Cursor<'a, K, V>
+impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Moves the cursor to the next element in the skip list.
-    ///
-    /// If the current element is the last one in the skiplist, the cursor is positioned to null.
-    pub fn next(&self) {
+    /// Moves to the next entry in the skip list.
+    pub fn next(&mut self) -> bool {
+        match self.get_next() {
+            None => false,
+            Some(n) => {
+                *self = n;
+                true
+            }
+        }
+    }
+
+    /// Moves to the previous entry in the skip list.
+    pub fn prev(&mut self) -> bool {
+        match self.get_prev() {
+            None => false,
+            Some(n) => {
+                *self = n;
+                true
+            }
+        }
+    }
+
+    pub fn get_next(&self) -> Option<Entry<'a, K, V>> {
         let guard = &epoch::pin();
-        let node_ref = unsafe { self.node.get().as_ref() };
+        let n = unsafe { &*self.node };
 
         loop {
-            let ptr = match node_ref {
-                None => {
-                    let head = unsafe { &*self.parent.head };
-                    head.tower()[0].load(SeqCst, guard)
-                }
-                Some(node) => {
-                    let succ = node.tower()[0].load(SeqCst, guard);
-                    if succ.tag() == 0 {
-                        succ
+            let succ = {
+                let succ = n.tower()[0].load(SeqCst, guard);
+                if succ.tag() == 0 {
+                    succ
+                } else {
+                    let search = self.parent.search(Some(&n.key), guard);
+                    if search.found {
+                        unsafe { search.right[0].deref().tower()[0].load(SeqCst, guard) }
                     } else {
-                        let search = self.parent.search(Some(&node.key), guard);
-                        if search.found {
-                            unsafe { search.right[0].deref().tower()[0].load(SeqCst, guard) }
-                        } else {
-                            search.right[0]
-                        }
+                        search.right[0]
                     }
                 }
             };
 
-            if ptr.tag() == 0 {
-                let success = unsafe {
-                    match ptr.as_ref() {
-                        None => true,
-                        Some(c) => !c.is_removed() && Node::increment(c),
-                    }
-                };
-
-                if success {
-                    if let Some(node) = node_ref {
-                        unsafe {
-                            Node::decrement(node);
+            if succ.tag() == 0 {
+                unsafe {
+                    match succ.as_ref() {
+                        None => return None,
+                        Some(s) => {
+                            if !s.is_removed() && Node::increment(s) {
+                                return Some(Entry::new(self.parent, s));
+                            }
                         }
                     }
-                    self.node.set(ptr.as_raw());
-                    return;
                 }
             }
         }
     }
 
-    /// Moves the cursor to the previous element in the skip list.
-    ///
-    /// If the current element is the first one in the skiplist, the cursor is positioned to null.
-    pub fn prev(&self) {
+    pub fn get_prev(&self) -> Option<Entry<'a, K, V>> {
         let guard = &epoch::pin();
 
         loop {
-            let search = self.parent.search(self.key(), guard);
+            let search = self.parent.search(Some(self.key()), guard);
             let pred = search.left[0];
 
-            unsafe {
-                if ptr::eq(pred, self.parent.head) {
-                    Node::decrement(self.node.get());
-                    self.node.set(ptr::null());
-                    break;
-                }
+            if ptr::eq(pred, self.parent.head) {
+                return None;
+            }
 
-                if Node::increment(pred) {
-                    Node::decrement(self.node.get());
-                    self.node.set(pred);
-                    break;
-                }
+            if unsafe { Node::increment(pred) } {
+                return Some(Entry::new(self.parent, pred));
             }
         }
     }
 
-    /// Positions the cursor to the first element with key equal to or greater than `key`.
+    /// Removes this entry from the skip list.
     ///
-    /// Returns `true` if an element with `key` is found.
-    pub fn seek<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let guard = &epoch::pin();
+    /// Returns `true` if this call removed the entry and `false` if it was already removed.
+    pub fn remove(&self) -> bool {
+        let n = unsafe { &*self.node };
 
-        loop {
-            let search = self.parent.search(Some(key), guard);
-            let node = search.right[0].as_raw();
-
-            unsafe {
-                if Node::increment(node) {
-                    Node::decrement(self.node.get());
-                    self.node.set(node);
-                    return search.found;
-                }
-            }
-        }
-    }
-
-    /// Positions the cursor to the first element in the skip list, if it exists.
-    pub fn seek_to_front(&self) -> bool {
-        self.node.swap(&self.parent.cursor().node);
-        self.next();
-        !self.is_null()
-    }
-
-    /// Positions the cursor to the last element in the skip list, if it exists.
-    pub fn seek_to_back(&self) -> bool {
-        self.node.swap(&self.parent.cursor().node);
-        self.prev();
-        !self.is_null()
-    }
-
-    /// If the current element is removed, seeks for its key to reposition the cursor.
-    ///
-    /// Returns `true` if the cursor didn't need repositioning or if the key didn't change after
-    /// repositioning.
-    ///
-    /// Otherwise, `false` is returned and the cursor is positioned to the first element with a
-    /// greater key. If no element with a greater key exists, then the cursor is positioned to
-    /// null.
-    pub fn reseek(&self) -> bool {
-        if self.is_null() || self.is_valid() {
+        if n.mark_tower() {
+            let guard = &epoch::pin();
+            self.parent.search(Some(&n.key), guard);
             true
         } else {
-            let c = self.clone();
-            self.seek(c.key().unwrap())
+            false
         }
-    }
-
-    /// Removes the element this cursor is positioned to.
-    ///
-    /// Returns `true` if this call removed the element.
-    ///
-    /// Returns `false` if the element was already removed or if the cursor is positioned to null.
-    pub fn remove(&self) -> bool {
-        if let Some(n) = unsafe { self.node.get().as_ref() } {
-            if n.mark_tower() {
-                let guard = &epoch::pin();
-                self.parent.search(Some(&n.key), guard);
-                return true;
-            }
-        }
-
-        false
     }
 }
 
-impl<'a, K, V> Drop for Cursor<'a, K, V>
+impl<'a, K, V> Drop for Entry<'a, K, V>
 where
     K: Send + 'static,
 {
     fn drop(&mut self) {
-        if !self.node.get().is_null() {
-            unsafe { Node::decrement(self.node.get()) }
+        unsafe { Node::decrement(self.node) }
+    }
+}
+
+impl<'a, K, V> Clone for Entry<'a, K, V>
+where
+    K: Send + 'static,
+{
+    fn clone(&self) -> Entry<'a, K, V> {
+        unsafe {
+            Node::increment(self.node);
+        }
+        Entry {
+            parent: self.parent,
+            node: self.node.clone(),
         }
     }
 }
 
-impl<'a, K, V> Clone for Cursor<'a, K, V>
+impl<'a, K, V> fmt::Debug for Entry<'a, K, V>
 where
-    K: Send + 'static,
+    K: Send + fmt::Debug + 'static,
+    V: fmt::Debug,
 {
-    fn clone(&self) -> Cursor<'a, K, V> {
-        unsafe {
-            Node::increment(self.node.get());
-        }
-        Cursor {
-            parent: self.parent,
-            node: self.node.clone(),
-        }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("Entry")
+            .field(&self.key())
+            .field(&self.value())
+            .finish()
     }
 }
 
@@ -991,11 +976,11 @@ mod tests {
 
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
-            assert_eq!(s.get(&elt).value(), Some(&(elt * 10)));
+            assert_eq!(*s.get(&elt).unwrap().value(), elt * 10);
         }
 
         for &elt in &not_present {
-            assert!(s.get(&elt).is_null());
+            assert!(s.get(&elt).is_none());
         }
     }
 
@@ -1012,22 +997,21 @@ mod tests {
         }
 
         for elt in &not_present {
-            assert!(s.remove(elt).is_null());
+            assert!(s.remove(elt).is_none());
         }
 
         for elt in &remove {
-            assert!(!s.remove(elt).is_null());
+            assert!(!s.remove(elt).is_none());
         }
 
-        let c = s.cursor();
-        c.next();
         let mut v = vec![];
-
-        while !c.is_null() {
-            v.push(*c.key().unwrap());
-            c.next();
+        let mut e = s.front().unwrap();
+        loop {
+            v.push(*e.key());
+            if !e.next() {
+                break;
+            }
         }
-
         assert_eq!(v, [0, 4, 5, 7, 11]);
 
         for elt in &insert {
@@ -1038,102 +1022,65 @@ mod tests {
     }
 
     #[test]
-    fn cursor() {
+    fn entry() {
         let insert = [4, 2, 12, 8, 7, 11, 5];
         let s = SkipList::new();
+
+        assert!(s.front().is_none());
+        assert!(s.back().is_none());
+
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
         }
 
-        let c = s.cursor();
-        assert!(c.is_null());
+        let mut e = s.front().unwrap();
+        assert_eq!(*e.key(), 2);
+        assert!(!e.prev());
+        assert!(e.next());
+        assert_eq!(*e.key(), 4);
 
-        c.next();
-        assert_eq!(c.key(), Some(&2));
-        c.prev();
-        assert!(c.is_null());
-        c.prev();
-        assert_eq!(c.key(), Some(&12));
-        c.prev();
-        assert_eq!(c.key(), Some(&11));
-        c.prev();
-        assert_eq!(c.key(), Some(&8));
+        e = s.back().unwrap();
+        assert_eq!(*e.key(), 12);
+        assert!(!e.next());
+        assert!(e.prev());
+        assert_eq!(*e.key(), 11);
     }
 
     #[test]
-    fn cursor_remove() {
+    fn entry_remove() {
         let insert = [4, 2, 12, 8, 7, 11, 5];
         let s = SkipList::new();
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
         }
 
-        let c = s.cursor();
-        c.seek(&7);
-        assert!(c.is_valid());
-        c.remove();
-        assert!(!c.is_valid());
+        let mut e = s.get(&7).unwrap();
+        assert!(!e.is_removed());
+        assert!(e.remove());
+        assert!(e.is_removed());
 
-        c.prev();
-        c.next();
-        assert_ne!(c.key(), Some(&7));
+        e.prev();
+        e.next();
+        assert_ne!(*e.key(), 7);
     }
 
     #[test]
-    fn cursor_reposition() {
+    fn entry_reposition() {
         let insert = [4, 2, 12, 8, 7, 11, 5];
         let s = SkipList::new();
         for &elt in &insert {
             s.insert(elt, elt * 10, false);
         }
 
-        let c = s.cursor();
-        c.seek(&7);
-        let c2 = c.clone();
-        c.remove();
+        let mut e = s.get(&7).unwrap();
+        assert!(!e.is_removed());
+        assert!(e.remove());
+        assert!(e.is_removed());
 
-        s.insert(7, 0, false);
-        c.prev();
-        c2.next();
-        assert_eq!(c.key(), Some(&5));
-        assert_eq!(c2.key(), Some(&8));
-
-        c.next();
-        c2.prev();
-        assert_eq!(c.key(), Some(&7));
-        assert_eq!(c.value(), Some(&0));
-        assert_eq!(c2.key(), Some(&7));
-        assert_eq!(c2.value(), Some(&0));
-    }
-
-    #[test]
-    fn seek() {
-        let insert = [4, 2, 12, 8, 7, 11, 5];
-        let s = SkipList::new();
-        for &elt in &insert {
-            s.insert(elt, elt * 10, false);
-        }
-
-        let c = s.cursor();
-
-        c.seek(&0);
-        assert_eq!(c.key(), Some(&2));
-
-        c.seek(&15);
-        assert_eq!(c.key(), None);
-
-        c.seek(&7);
-        assert_eq!(c.key(), Some(&7));
-        assert_eq!(c.value(), Some(&70));
-
-        c.seek(&6);
-        assert_eq!(c.key(), Some(&7));
-
-        c.seek_to_front();
-        assert_eq!(c.key(), Some(&2));
-
-        c.seek_to_back();
-        assert_eq!(c.key(), Some(&12));
+        s.insert(7, 700, false);
+        e.prev();
+        e.next();
+        assert_eq!(*e.key(), 7);
     }
 
     #[test]

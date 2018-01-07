@@ -35,26 +35,12 @@ where
 
     /// Returns the entry with the smallest key.
     pub fn front(&self) -> Option<Entry<K, V>> {
-        let c = self.inner.cursor();
-        c.seek_to_front();
-
-        if c.is_null() {
-            None
-        } else {
-            Some(Entry { inner: c })
-        }
+        self.inner.back().map(Entry::new)
     }
 
     /// Returns the entry with the largest key.
     pub fn back(&self) -> Option<Entry<K, V>> {
-        let c = self.inner.cursor();
-        c.seek_to_back();
-
-        if c.is_null() {
-            None
-        } else {
-            Some(Entry { inner: c })
-        }
+        self.inner.back().map(Entry::new)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -66,20 +52,13 @@ where
         self.get(key).is_some()
     }
 
-    /// Returns a cursor positioned to the element corresponding to the key.
-    ///
-    /// If the such an element doesn't exist, the cursor will be positioned to null.
+    /// Returns an entry with the specified key.
     pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let c = self.inner.get(key);
-        if c.is_null() {
-            None
-        } else {
-            Some(Entry { inner: c })
-        }
+        self.inner.get(key).map(Entry::new)
     }
 
     /// Inserts a new key-value pair into the map.
@@ -87,9 +66,7 @@ where
     /// If there is an existing pair with this key, it will be removed before inserting the new
     /// pair. The returned cursor will be positioned to the new pair.
     pub fn insert(&self, key: K, value: V) -> Entry<K, V> {
-        Entry {
-            inner: self.inner.insert(key, value, true),
-        }
+        Entry::new(self.inner.insert(key, value, true))
     }
 
     /// Finds an element with the specified key, or inserts a new key-value pair if it doesn't
@@ -98,30 +75,19 @@ where
     /// The returned cursor will be positioned to the found element, or the new one if it was
     /// inserted.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
-        Entry {
-            inner: self.inner.insert(key, value, false),
-        }
+        Entry::new(self.inner.insert(key, value, false))
     }
 
-    /// Removes an element from the map and returns a cursor positioned to it.
-    ///
-    /// If no element with the specified key exists, the returned cursor will be positioned to
-    /// null.
+    /// Removes an entry with the specified key from the map and returns it.
     pub fn remove<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let c = self.inner.remove(key);
-
-        if c.is_null() {
-            None
-        } else {
-            Some(Entry { inner: c })
-        }
+        self.inner.remove(key).map(Entry::new)
     }
 
-    /// Clears the map, removing all elements.
+    /// Iterates over the map and removes each entry.
     pub fn clear(&self) {
         self.inner.clear();
     }
@@ -193,32 +159,33 @@ where
     K: Send + 'static,
     V: 'a,
 {
-    inner: base::Cursor<'a, K, V>,
+    inner: base::Entry<'a, K, V>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
-// TODO: rename 'cursor' in docs
-
 impl<'a, K, V> Entry<'a, K, V>
 where
     K: Send + 'static,
 {
-    /// Returns the key of the current element.
+    fn new(inner: base::Entry<'a, K, V>) -> Entry<'a, K, V> {
+        Entry { inner }
+    }
+
+    /// Returns a reference to the key.
     pub fn key(&self) -> &K {
-        self.inner.key().unwrap()
+        self.inner.key()
     }
 
-    /// Returns the value of the current element.
+    /// Returns a reference to the value.
     pub fn value(&self) -> &V {
-        self.inner.value().unwrap()
+        self.inner.value()
     }
 
-    /// Returns `true` if the cursor is positioned to a valid element (not null and not removed).
+    /// Returns `true` if this entry is removed from the map.
     pub fn is_removed(&self) -> bool {
-        // self.inner.is_removed()
-        unimplemented!()
+        self.inner.is_removed()
     }
 }
 
@@ -226,27 +193,25 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Moves the cursor to the next element in the map.
-    pub fn next(&self) -> Option<Entry<'a, K, V>> {
-        let c = self.inner.clone();
-        c.next();
-
-        if c.is_null() {
-            None
-        } else {
-            Some(Entry { inner: c })
-        }
+    pub fn next(&mut self) -> bool {
+        self.inner.next()
     }
 
-    /// Moves the cursor to the previous element in the map.
-    pub fn prev(&self) -> Option<Entry<'a, K, V>> {
-        // self.inner.prev();
-        unimplemented!()
+    pub fn prev(&mut self) -> bool {
+        self.inner.prev()
     }
 
-    /// Removes the element this cursor is positioned to.
+    pub fn get_next(&self) -> Option<Entry<'a, K, V>> {
+        self.inner.get_next().map(Entry::new)
+    }
+
+    pub fn get_prev(&self) -> Option<Entry<'a, K, V>> {
+        self.inner.get_prev().map(Entry::new)
+    }
+
+    /// Removes this entry from the map.
     ///
-    /// Returns `true` if this call removed the element and `false` if it was already removed.
+    /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
         self.inner.remove()
     }
@@ -262,16 +227,6 @@ where
     /// If there is an existing pair with this key, it will be removed before inserting the new
     /// pair. The returned cursor will be positioned to the new pair.
     pub fn replace(&self, value: V) -> Option<Entry<'a, K, V>> {
-        // match self.key() {
-        //     None => self.clone(),
-        //     Some(k) => {
-        //         let c = self.inner.parent.insert(k.clone(), value, true);
-        //         self.inner.node.swap(&c.node);
-        //         Entry {
-        //             inner: c,
-        //         }
-        //     }
-        // }
         unimplemented!()
     }
 }
@@ -346,14 +301,18 @@ where
         if self.finished {
             None
         } else {
-            let e = match self.entry.as_ref() {
-                None => self.parent.front(),
-                Some(ref e) => e.next(),
-            };
+            if let Some(e) = self.entry.as_mut() {
+                if e.next() {
+                    return Some(e.clone());
+                } else {
+                    self.finished = true;
+                    return None;
+                }
+            }
 
-            self.entry = e.clone();
-            self.finished = e.is_none();
-            e
+            self.entry = self.parent.front();
+            self.finished = self.entry.is_none();
+            self.entry.clone()
         }
     }
 }
