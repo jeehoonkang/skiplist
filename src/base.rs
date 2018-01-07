@@ -2,15 +2,13 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::mem;
 use std::ptr;
-use std::slice;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
 
 use epoch::{self, Atomic, Guard, Shared};
 
-const BRANCHING: usize = 4;
-const MAX_HEIGHT: usize = 12;
-const HEIGHT_BITS: usize = 4;
+const MAX_HEIGHT: usize = 32;
+const HEIGHT_BITS: usize = 5;
 const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
 
 /// A skip list node.
@@ -81,10 +79,9 @@ impl<K, V> Node<K, V> {
         (self.refs_and_height.load(Relaxed) & HEIGHT_MASK) + 1
     }
 
-    /// Returns the tower as a slice.
     #[inline]
-    fn tower(&self) -> &[Atomic<Self>] {
-        unsafe { slice::from_raw_parts(&self.pointers[0], self.height()) }
+    unsafe fn tower(&self, level: usize) -> &Atomic<Self> {
+        self.pointers.get_unchecked(level)
     }
 
     /// Increments the reference counter of a node and returns `true` on success.
@@ -123,7 +120,7 @@ impl<K, V> Node<K, V> {
 
         for level in (0..height).rev() {
             let next =
-                unsafe { self.tower()[level].fetch_or(1, SeqCst, epoch::unprotected()) };
+                unsafe { self.tower(level).fetch_or(1, SeqCst, epoch::unprotected()) };
 
             if level == 0 && next.tag() == 1 {
                 return false;
@@ -134,7 +131,7 @@ impl<K, V> Node<K, V> {
     }
 
     fn is_removed(&self) -> bool {
-        unsafe { self.tower()[0].load(SeqCst, epoch::unprotected()).tag() == 1 }
+        unsafe { self.tower(0).load(SeqCst, epoch::unprotected()).tag() == 1 }
     }
 }
 
@@ -197,16 +194,16 @@ where
 {
     /// Returns `true` if the skip list is empty.
     pub fn is_empty(&self) -> bool {
-        if unsafe { (*self.head).tower()[0].load(SeqCst, epoch::unprotected()).is_null() } {
-            return true;
-        }
+        unsafe {
+            if (*self.head).tower(0).load(SeqCst, epoch::unprotected()).is_null() {
+                return true;
+            }
 
-        let guard = &epoch::pin();
+            let guard = &epoch::pin();
 
-        loop {
-            unsafe {
+            loop {
                 let head = &*self.head;
-                let ptr = head.tower()[0].load(SeqCst, guard);
+                let ptr = head.tower(0).load(SeqCst, guard);
 
                 match ptr.as_ref() {
                     None => return true,
@@ -250,7 +247,7 @@ where
         loop {
             unsafe {
                 let head = &*self.head;
-                let ptr = head.tower()[0].load(SeqCst, guard);
+                let ptr = head.tower(0).load(SeqCst, guard);
 
                 match ptr.as_ref() {
                     None => return None,
@@ -258,7 +255,7 @@ where
                         if n.is_removed() {
                             self.search(Some(&n.key), guard);
                         } else if Node::increment(n) {
-                            return Some(Entry::new(self, n));
+                            return Some(Entry::from_raw(self, n));
                         }
                     }
                 }
@@ -278,7 +275,7 @@ where
                 if ptr::eq(node, self.head) {
                     return None;
                 } else if Node::increment(node) {
-                    return Some(Entry::new(self, node));
+                    return Some(Entry::from_raw(self, node));
                 }
             }
         }
@@ -288,18 +285,12 @@ where
     fn random_height(&self) -> usize {
         // From "Xorshift RNGs" by George Marsaglia.
         let mut num = self.seed.load(Relaxed);
-        num ^= num >> 12;
-        num ^= num << 25;
-        num ^= num >> 27;
-        num = num.wrapping_mul(0x2545F4914F6CDD1Du64 as usize);
+        num ^= num << 13;
+        num ^= num >> 17;
+        num ^= num << 5;
         self.seed.store(num, Relaxed);
 
-        let mut height = 1;
-        while height < MAX_HEIGHT && num % BRANCHING == 1 {
-            height += 1;
-            num /= BRANCHING;
-        }
-        height
+        num.trailing_zeros() as usize + 1
     }
 
     fn search<'g, Q>(&self, key: Option<&Q>, guard: &'g Guard) -> Search<'g, K, V>
@@ -307,174 +298,163 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut s = Search {
-            found: false,
-            left: unsafe { mem::zeroed() },
-            right: unsafe { mem::zeroed() },
-        };
-
-        'search: loop {
-            // The current node we're at.
-            let mut node = unsafe { &*self.head };
-
-            // Traverse the skip list from the highest to the lowest level.
-            for level in (0..MAX_HEIGHT).rev() {
-                let mut pred = node;
-                let mut curr = pred.tower()[level].load(SeqCst, guard);
-
-                // If `curr` is marked, that means `pred` is deleted and we have to restart the
-                // search.
-                if curr.tag() == 1 {
-                    continue 'search;
-                }
-
-                // Iterate through the current level until we reach a node with a key greater than
-                // or equal to `key`.
-                while let Some(c) = unsafe { curr.as_ref() } {
-                    let succ = c.tower()[level].load(SeqCst, guard);
-
-                    if succ.tag() == 1 {
-                        // If `succ` is marked, that means `curr` is deleted. Let's try unlinking
-                        // it from the skip list at this level.
-                        match pred.tower()[level].compare_and_set(
-                            curr,
-                            succ.with_tag(0),
-                            SeqCst,
-                            guard,
-                        ) {
-                            Ok(_) => {
-                                // On success, decrement the reference counter of `curr` and
-                                // continue searching through the current level.
-                                unsafe {
-                                    Node::decrement(curr.as_raw());
-                                }
-                                curr = succ.with_tag(0);
-                                continue;
-                            }
-                            Err(_) => {
-                                // On failure, we cannot do anything reasonable to continue
-                                // searching from the current position. Restart the search.
-                                continue 'search;
-                            }
-                        }
-                    }
-
-                    // If `curr` contains a key that is greater than or equal to `key`, we're done
-                    // with this level.
-                    if key.map(|k| c.key.borrow() >= k) == Some(true) {
-                        break;
-                    }
-
-                    // Move one step forward.
-                    pred = c;
-                    curr = succ;
-                }
-
-                // Store the position at the current level into the result.
-                s.left[level] = pred;
-                s.right[level] = curr;
-
-                node = pred;
-            }
-
-            // Check if we have found a node with key equal to `key`.
-            s.found = unsafe {
-                s.right[0].as_ref().map(|r| Some(r.key.borrow()) == key) == Some(true)
+        unsafe {
+            let mut s = Search {
+                found: false,
+                left: mem::zeroed(),
+                right: mem::zeroed(),
             };
 
-            return s;
+            'search: loop {
+                // The current node we're at.
+                let mut node = &*self.head;
+
+                // Traverse the skip list from the highest to the lowest level.
+                for level in (0..MAX_HEIGHT).rev() {
+                    let mut pred = node;
+                    let mut curr = pred.tower(level).load(SeqCst, guard);
+
+                    // If `curr` is marked, that means `pred` is deleted and we have to restart the
+                    // search.
+                    if curr.tag() == 1 {
+                        continue 'search;
+                    }
+
+                    // Iterate through the current level until we reach a node with a key greater
+                    // than or equal to `key`.
+                    while let Some(c) = curr.as_ref() {
+                        let succ = c.tower(level).load(SeqCst, guard);
+
+                        if succ.tag() == 1 {
+                            // If `succ` is marked, that means `curr` is deleted. Let's try
+                            // unlinking it from the skip list at this level.
+                            match pred.tower(level).compare_and_set(
+                                curr,
+                                succ.with_tag(0),
+                                SeqCst,
+                                guard,
+                            ) {
+                                Ok(_) => {
+                                    // On success, decrement the reference counter of `curr` and
+                                    // continue searching through the current level.
+                                    Node::decrement(curr.as_raw());
+                                    curr = succ.with_tag(0);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    // On failure, we cannot do anything reasonable to continue
+                                    // searching from the current position. Restart the search.
+                                    continue 'search;
+                                }
+                            }
+                        }
+
+                        // If `curr` contains a key that is greater than or equal to `key`, we're
+                        // done with this level.
+                        if key.map(|k| c.key.borrow() >= k) == Some(true) {
+                            break;
+                        }
+
+                        // Move one step forward.
+                        pred = c;
+                        curr = succ;
+                    }
+
+                    // Store the position at the current level into the result.
+                    s.left[level] = pred;
+                    s.right[level] = curr;
+
+                    node = pred;
+                }
+
+                // Check if we have found a node with key equal to `key`.
+                s.found = s.right[0].as_ref().map(|r| Some(r.key.borrow()) == key) == Some(true);
+
+                return s;
+            }
         }
     }
 
     pub fn insert(&self, key: K, value: V, replace: bool) -> Entry<K, V> {
         let guard = &epoch::pin();
-
-        // First try searching for the key.
-        // Note that the `Ord` implementation for `K` may panic during the search.
         let mut search;
 
-        loop {
-            search = self.search(Some(&key), guard);
+        unsafe {
+            loop {
+                // First try searching for the key.
+                // Note that the `Ord` implementation for `K` may panic during the search.
+                search = self.search(Some(&key), guard);
 
-            if !search.found {
-                break;
-            }
-
-            // If a node with the key was found and we're not going to replace it, let's try
-            // creating an entry positioned to it.
-            let r = search.right[0];
-
-            if replace {
-                unsafe {
-                    r.deref().mark_tower();
-                }
-            } else {
-                unsafe {
-                    // Try incrementing its reference count.
-                    if Node::increment(r.as_raw()) {
-                        // Success!
-                        return Entry::new(self, r.deref());
-                    }
-                    // If we couldn't increment the reference count, that means that someone has just
-                    // deleted the node.
+                if !search.found {
                     break;
                 }
-            }
-        }
 
-        // Create a new node.
-        let height = self.random_height();
-        let (node, n) = unsafe {
-            let n = Node::<K, V>::alloc(height);
-
-            // Write the key and the value into the node.
-            ptr::write(&mut (*n).key, key);
-            ptr::write(&mut (*n).value, value);
-
-            // The reference count is initially zero. Let's increment it twice to account for:
-            // 1. The entry that will be returned.
-            // 2. The link at the level 0 of the tower.
-            (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, Relaxed);
-
-            (Shared::<Node<K, V>>::from(n as *const _), &*n)
-        };
-
-        loop {
-            // Set the lowest successor of `n` to `search.right[0]`.
-            n.tower()[0].store(search.right[0], SeqCst);
-
-            // Try installing the new node into the skip list.
-            if search.left[0].tower()[0]
-                .compare_and_set(search.right[0], node, SeqCst, guard)
-                .is_ok()
-            {
-                break;
-            }
-
-            // We failed. Let's search for the key and try again.
-            search = {
-                // Create a guard that destroys the new node in case search panics.
-                defer_on_unwind! {
-                    unsafe {
-                        ptr::drop_in_place(&n.key as *const K as *mut K);
-                        ptr::drop_in_place(&n.value as *const V as *mut V);
-                        Node::dealloc(node.as_raw() as *mut Node<K, V>);
-                    }
-                }
-                self.search(Some(&n.key), guard)
-            };
-
-            // If a node with the key was found and we're not going to replace it, let's try
-            // creating an entry positioned to it.
-            if search.found {
+                // If a node with the key was found and we're not going to replace it, let's try
+                // creating an entry positioned to it.
                 let r = search.right[0];
 
                 if replace {
-                    unsafe {
-                        r.deref().mark_tower();
-                    }
+                    r.deref().mark_tower();
                 } else {
-                    unsafe {
+                    // Try incrementing its reference count.
+                    if Node::increment(r.as_raw()) {
+                        // Success!
+                        return Entry::from_raw(self, r.as_raw());
+                    }
+                    // If we couldn't increment the reference count, that means that someone has
+                    // just deleted the node.
+                    break;
+                }
+            }
+
+            // Create a new node.
+            let height = self.random_height();
+            let (node, n) = {
+                let n = Node::<K, V>::alloc(height);
+
+                // Write the key and the value into the node.
+                ptr::write(&mut (*n).key, key);
+                ptr::write(&mut (*n).value, value);
+
+                // The reference count is initially zero. Let's increment it twice to account for:
+                // 1. The entry that will be returned.
+                // 2. The link at the level 0 of the tower.
+                (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, Relaxed);
+
+                (Shared::<Node<K, V>>::from(n as *const _), &*n)
+            };
+
+            loop {
+                // Set the lowest successor of `n` to `search.right[0]`.
+                n.tower(0).store(search.right[0], SeqCst);
+
+                // Try installing the new node into the skip list.
+                if search.left[0].tower(0)
+                    .compare_and_set(search.right[0], node, SeqCst, guard)
+                    .is_ok()
+                {
+                    break;
+                }
+
+                // We failed. Let's search for the key and try again.
+                search = {
+                    // Create a guard that destroys the new node in case search panics.
+                    defer_on_unwind! {{
+                        ptr::drop_in_place(&n.key as *const K as *mut K);
+                        ptr::drop_in_place(&n.value as *const V as *mut V);
+                        Node::dealloc(node.as_raw() as *mut Node<K, V>);
+                    }}
+                    self.search(Some(&n.key), guard)
+                };
+
+                // If a node with the key was found and we're not going to replace it, let's try
+                // creating an entry positioned to it.
+                if search.found {
+                    let r = search.right[0];
+
+                    if replace {
+                        r.deref().mark_tower();
+                    } else {
                         // Try incrementing its reference count.
                         if Node::increment(r.as_raw()) {
                             // Success! Let's deallocate the new node and return an entry
@@ -484,102 +464,104 @@ where
                             ptr::drop_in_place(&mut (*raw).value);
                             Node::dealloc(raw);
 
-                            return Entry::new(self, r.deref());
+                            return Entry::from_raw(self, r.as_raw());
                         }
                         // If we couldn't increment the reference count, that means that someone
                         // has just deleted the node.
                     }
                 }
             }
-        }
 
-        // The node was successfully inserted. Let's create an entry positioned to it.
-        let entry = Entry::new(self, n as *const _ as *mut _);
+            // The node was successfully inserted. Let's create an entry positioned to it.
+            let entry = Entry::from_raw(self, n);
 
-        // Build the rest of the tower above level 0.
-        'build: for level in 1..height {
-            loop {
-                // Obtain the predecessor and successor at the current level.
-                let pred = search.left[level];
-                let succ = search.right[level];
+            // Build the rest of the tower above level 0.
+            'build: for level in 1..height {
+                loop {
+                    // Obtain the predecessor and successor at the current level.
+                    let pred = search.left[level];
+                    let succ = search.right[level];
 
-                // Load the current value of the pointer in the tower.
-                let next = n.tower()[level].load(SeqCst, guard);
+                    // Load the current value of the pointer in the tower.
+                    let next = n.tower(level).load(SeqCst, guard);
 
-                // If the current pointer is marked, that means another thread is already deleting
-                // the node we've just inserted. In that case, let's just stop building the tower.
-                if next.tag() == 1 {
-                    break 'build;
-                }
+                    // If the current pointer is marked, that means another thread is already
+                    // deleting the node we've just inserted. In that case, let's just stop
+                    // building the tower.
+                    if next.tag() == 1 {
+                        break 'build;
+                    }
 
-                // When searching for `key` and traversing the skip list from the highest level to
-                // the lowest, it is possible to observe a node with an equal key at higher levels
-                // and then find it missing at the lower levels if it gets removed during traversal.
-                // Even worse, it is possible to observe completely different nodes with the exact
-                // same key at different levels.
-                //
-                // Linking the new node to a dead successor with an equal key would create subtle
-                // corner cases that would require special care. It's much easier to simply prevent
-                // linking two nodes with equal keys.
-                //
-                // If the successor has the same key as the new node, that means it is marked as
-                // deleted and should be unlinked from the skip list. In that case, let's repeat
-                // the search to make sure it gets unlinked and try again.
-                if unsafe { succ.as_ref().map(|s| &s.key) } == Some(&n.key) {
+                    // When searching for `key` and traversing the skip list from the highest level
+                    // to the lowest, it is possible to observe a node with an equal key at higher
+                    // levels and then find it missing at the lower levels if it gets removed
+                    // during traversal.  Even worse, it is possible to observe completely
+                    // different nodes with the exact same key at different levels.
+                    //
+                    // Linking the new node to a dead successor with an equal key would create
+                    // subtle corner cases that would require special care. It's much easier to
+                    // simply prevent linking two nodes with equal keys.
+                    //
+                    // If the successor has the same key as the new node, that means it is marked
+                    // as deleted and should be unlinked from the skip list. In that case, let's
+                    // repeat the search to make sure it gets unlinked and try again.
+                    if succ.as_ref().map(|s| &s.key) == Some(&n.key) {
+                        // If this search panics, we simply stop building the tower without
+                        // breaking any invariants. Note that building higher levels is completely
+                        // optional.  Only the lowest level really matters, and all the higher
+                        // levels are there just to make searching faster.
+                        search = self.search(Some(&n.key), guard);
+                        continue;
+                    }
+
+                    // Change the pointer at the current level from `next` to `succ`. If this CAS
+                    // operation fails, that means another thread has marked the pointer and we
+                    // should stop building the tower.
+                    if n.tower(level)
+                        .compare_and_set(next, succ, SeqCst, guard)
+                        .is_err()
+                    {
+                        break 'build;
+                    }
+
+                    // Increment the reference count. The current value will always be at least 1
+                    // because we are holding
+                    (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, Relaxed);
+
+                    // Try installing the new node at the current level.
+                    if pred.tower(level)
+                        .compare_and_set(succ, node, SeqCst, guard)
+                        .is_ok()
+                    {
+                        // Success! Continue on the next level.
+                        break;
+                    }
+
+                    // Installation failed. Decrement the reference count.
+                    (*n).refs_and_height.fetch_sub(1 << HEIGHT_BITS, Relaxed);
+
+                    // We don't have the most up-to-date search results. Repeat the search.
+                    //
                     // If this search panics, we simply stop building the tower without breaking
                     // any invariants. Note that building higher levels is completely optional.
                     // Only the lowest level really matters, and all the higher levels are there
                     // just to make searching faster.
                     search = self.search(Some(&n.key), guard);
-                    continue;
                 }
-
-                // Change the pointer at the current level from `next` to `succ`. If this CAS
-                // operation fails, that means another thread has marked the pointer and we should
-                // stop building the tower.
-                if n.tower()[level]
-                    .compare_and_set(next, succ, SeqCst, guard)
-                    .is_err()
-                {
-                    break 'build;
-                }
-
-                // Increment the reference count. The current value will always be at least 1
-                // because we are holding
-                (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, Relaxed);
-
-                // Try installing the new node at the current level.
-                if pred.tower()[level]
-                    .compare_and_set(succ, node, SeqCst, guard)
-                    .is_ok()
-                {
-                    // Success! Continue on the next level.
-                    break;
-                }
-
-                // Installation failed. Decrement the reference count.
-                (*n).refs_and_height.fetch_sub(1 << HEIGHT_BITS, Relaxed);
-
-                // We don't have the most up-to-date search results. Repeat the search.
-                //
-                // If this search panics, we simply stop building the tower without breaking any
-                // invariants. Note that building higher levels is completely optional. Only the
-                // lowest level really matters, and all the higher levels are there just to make
-                // searching faster.
-                search = self.search(Some(&n.key), guard);
             }
-        }
 
-        // If a pointer in the tower is marked, that means our node is in the process of deletion or
-        // already deleted. It is possible that another thread (either partially or completely)
-        // deleted the new node while we were building the tower, and just after that we installed
-        // the new node at one of the higher levels. In order to undo that installation, we must
-        // repeat the search, which will unlink the new node at that level.
-        if n.tower()[height - 1].load(SeqCst, guard).tag() == 1 {
-            self.search(Some(&n.key), guard);
-        }
+            // If a pointer in the tower is marked, that means our node is in the process of
+            // deletion or already deleted. It is possible that another thread (either partially or
+            // completely) deleted the new node while we were building the tower, and just after
+            // that we installed the new node at one of the higher levels. In order to undo that
+            // installation, we must repeat the search, which will unlink the new node at that
+            // level.
+            if n.tower(height - 1).load(SeqCst, guard).tag() == 1 {
+                self.search(Some(&n.key), guard);
+            }
 
-        entry
+            entry
+        }
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
@@ -597,8 +579,10 @@ where
 
             let node = search.right[0].as_raw();
 
-            if unsafe { Node::increment(node) } {
-                return Some(Entry::new(self, node));
+            unsafe {
+                if Node::increment(node) {
+                    return Some(Entry::from_raw(self, node));
+                }
             }
         }
     }
@@ -618,33 +602,36 @@ where
             }
 
             let node = search.right[0];
-            let n = unsafe { node.deref() };
 
-            if unsafe { !Node::increment(n) } {
-                continue;
-            }
+            unsafe {
+                let n = node.deref();
 
-            let entry = Entry::new(self, n);
-
-            if !n.mark_tower() {
-                continue;
-            }
-
-            for level in (0..n.height()).rev() {
-                let succ = n.tower()[level].load(SeqCst, guard).with_tag(0);
-
-                if search.left[level].tower()[level]
-                    .compare_and_set(node, succ, SeqCst, guard)
-                    .is_ok()
-                {
-                    unsafe { Node::decrement(n); }
-                } else {
-                    self.search(Some(key), guard);
-                    break;
+                if !Node::increment(n) {
+                    continue;
                 }
-            }
 
-            return Some(entry);
+                let entry = Entry::from_raw(self, n);
+
+                if !n.mark_tower() {
+                    continue;
+                }
+
+                for level in (0..n.height()).rev() {
+                    let succ = n.tower(level).load(SeqCst, guard).with_tag(0);
+
+                    if search.left[level].tower(level)
+                        .compare_and_set(node, succ, SeqCst, guard)
+                        .is_ok()
+                    {
+                        Node::decrement(n);
+                    } else {
+                        self.search(Some(key), guard);
+                        break;
+                    }
+                }
+
+                return Some(entry);
+            }
         }
     }
 
@@ -661,7 +648,7 @@ where
                 }
 
                 let next = entry.get_next();
-                unsafe { (*entry.node).mark_tower() };
+                entry.node.mark_tower();
 
                 match next {
                     None => break,
@@ -686,7 +673,7 @@ impl<K, V> Drop for SkipList<K, V> {
                     ptr::drop_in_place(&mut (*node).value);
                 }
 
-                let next = (*node).tower()[0].load(Relaxed, epoch::unprotected());
+                let next = (*node).tower(0).load(Relaxed, epoch::unprotected());
                 Node::dealloc(node);
                 node = next.as_raw() as *mut Node<K, V>;
             }
@@ -700,12 +687,12 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 
     fn into_iter(self) -> IntoIter<K, V> {
         unsafe {
-            let next = (*self.head).tower()[0]
+            let next = (*self.head).tower(0)
                 .load(Relaxed, epoch::unprotected())
                 .as_raw();
 
             for level in 0..MAX_HEIGHT {
-                (*self.head).tower()[level].store(Shared::null(), Relaxed);
+                (*self.head).tower(level).store(Shared::null(), Relaxed);
             }
 
             IntoIter {
@@ -738,7 +725,7 @@ where
     V: 'a,
 {
     pub parent: &'a SkipList<K, V>,
-    pub node: *const Node<K, V>,
+    pub node: &'a Node<K, V>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
@@ -748,26 +735,33 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Send + 'static,
 {
-    fn new(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
+    fn new(parent: &'a SkipList<K, V>, node: &'a Node<K, V>) -> Self {
         Entry {
             parent,
             node,
         }
     }
 
+    unsafe fn from_raw(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
+        Entry {
+            parent,
+            node: &*node,
+        }
+    }
+
     /// Returns `true` if this entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
-        unsafe { (*self.node).is_removed() }
+        self.node.is_removed()
     }
 
     /// Returns a reference to the key.
     pub fn key(&self) -> &K {
-        unsafe { &(*self.node).key }
+        &self.node.key
     }
 
     /// Returns a reference to the value.
     pub fn value(&self) -> &V {
-        unsafe { &(*self.node).value }
+        &self.node.value
     }
 }
 
@@ -799,30 +793,29 @@ where
 
     pub fn get_next(&self) -> Option<Entry<'a, K, V>> {
         let guard = &epoch::pin();
-        let n = unsafe { &*self.node };
 
         loop {
-            let succ = {
-                let succ = n.tower()[0].load(SeqCst, guard);
-                if succ.tag() == 0 {
-                    succ
-                } else {
-                    let search = self.parent.search(Some(&n.key), guard);
-                    if search.found {
-                        unsafe { search.right[0].deref().tower()[0].load(SeqCst, guard) }
+            unsafe {
+                let succ = {
+                    let succ = self.node.tower(0).load(SeqCst, guard);
+                    if succ.tag() == 0 {
+                        succ
                     } else {
-                        search.right[0]
+                        let search = self.parent.search(Some(&self.node.key), guard);
+                        if search.found {
+                            search.right[0].deref().tower(0).load(SeqCst, guard)
+                        } else {
+                            search.right[0]
+                        }
                     }
-                }
-            };
+                };
 
-            if succ.tag() == 0 {
-                unsafe {
+                if succ.tag() == 0 {
                     match succ.as_ref() {
                         None => return None,
                         Some(s) => {
                             if !s.is_removed() && Node::increment(s) {
-                                return Some(Entry::new(self.parent, s));
+                                return Some(Entry::from_raw(self.parent, s));
                             }
                         }
                     }
@@ -842,8 +835,10 @@ where
                 return None;
             }
 
-            if unsafe { Node::increment(pred) } {
-                return Some(Entry::new(self.parent, pred));
+            unsafe {
+                if Node::increment(pred) {
+                    return Some(Entry::from_raw(self.parent, pred));
+                }
             }
         }
     }
@@ -852,11 +847,9 @@ where
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
-        let n = unsafe { &*self.node };
-
-        if n.mark_tower() {
+        if self.node.mark_tower() {
             let guard = &epoch::pin();
-            self.parent.search(Some(&n.key), guard);
+            self.parent.search(Some(&self.node.key), guard);
             true
         } else {
             false
@@ -883,7 +876,7 @@ where
         }
         Entry {
             parent: self.parent,
-            node: self.node.clone(),
+            node: self.node,
         }
     }
 }
@@ -914,15 +907,16 @@ impl<K, V> Iterator for IntoIter<K, V> {
                 return None;
             }
 
-            let key = unsafe { ptr::read(&mut (*self.node).key) };
-            let value = unsafe { ptr::read(&mut (*self.node).value) };
+            unsafe {
+                let key = ptr::read(&mut (*self.node).key);
+                let value = ptr::read(&mut (*self.node).value);
 
-            let next =
-                unsafe { (*self.node).tower()[0].load(Relaxed, epoch::unprotected()) };
-            self.node = next.as_raw() as *mut Node<K, V>;
+                let next = (*self.node).tower(0).load(Relaxed, epoch::unprotected());
+                self.node = next.as_raw() as *mut Node<K, V>;
 
-            if next.tag() == 0 {
-                return Some((key, value));
+                if next.tag() == 0 {
+                    return Some((key, value));
+                }
             }
         }
     }

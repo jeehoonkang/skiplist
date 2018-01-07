@@ -61,19 +61,20 @@ where
         self.inner.get(key).map(Entry::new)
     }
 
-    /// Inserts a new key-value pair into the map.
+    /// Inserts a key-value pair into the map and returns the new entry.
     ///
-    /// If there is an existing pair with this key, it will be removed before inserting the new
-    /// pair. The returned cursor will be positioned to the new pair.
+    /// If there is an existing entry with this key, it will be removed before inserting the new
+    /// one.
     pub fn insert(&self, key: K, value: V) -> Entry<K, V> {
         Entry::new(self.inner.insert(key, value, true))
     }
 
-    /// Finds an element with the specified key, or inserts a new key-value pair if it doesn't
-    /// exist.
-    ///
-    /// The returned cursor will be positioned to the found element, or the new one if it was
-    /// inserted.
+    /// Inserts a key-value pair into the map and returns the old entry with this key.
+    pub fn replace(&self, key: K, value: V) -> Option<Entry<K, V>> {
+        unimplemented!()
+    }
+
+    /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
         Entry::new(self.inner.insert(key, value, false))
     }
@@ -221,14 +222,9 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Clone + Ord + Send + 'static,
 {
-    /// Inserts a new key-value pair into the map. TODO
-    ///
-    /// The cursor will be positioned to the new pair and the old one
-    /// If there is an existing pair with this key, it will be removed before inserting the new
-    /// pair. The returned cursor will be positioned to the new pair.
-    pub fn replace(&self, value: V) -> Option<Entry<'a, K, V>> {
-        unimplemented!()
-    }
+    // pub fn replace(&mut self, value: V) -> Option<Entry<'a, K, V>> {
+    //     unimplemented!()
+    // }
 }
 
 impl<'a, K, V> Clone for Entry<'a, K, V>
