@@ -69,11 +69,6 @@ where
         Entry::new(self.inner.insert(key, value, true))
     }
 
-    /// Inserts a key-value pair into the map and returns the old entry with this key.
-    pub fn replace(&self, key: K, value: V) -> Option<Entry<K, V>> {
-        unimplemented!()
-    }
-
     /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
         Entry::new(self.inner.insert(key, value, false))

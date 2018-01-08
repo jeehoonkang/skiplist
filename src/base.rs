@@ -290,7 +290,14 @@ where
         num ^= num << 5;
         self.seed.store(num, Relaxed);
 
-        num.trailing_zeros() as usize + 1
+        let mut height = num.trailing_zeros() as usize + 1;
+        unsafe {
+            let guard = epoch::unprotected();
+            while height >= 4 && (*self.head).tower(height - 2).load(Relaxed, guard).is_null() {
+                height -= 1;
+            }
+        }
+        height
     }
 
     fn search<'g, Q>(&self, key: Option<&Q>, guard: &'g Guard) -> Search<'g, K, V>
@@ -301,16 +308,27 @@ where
         unsafe {
             let mut s = Search {
                 found: false,
-                left: mem::zeroed(),
-                right: mem::zeroed(),
+                left: mem::uninitialized(),
+                right: mem::uninitialized(),
             };
 
             'search: loop {
+                let mut level = MAX_HEIGHT;
+
+                while level >= 1 && (*self.head).tower(level - 1).load(SeqCst, guard).is_null() {
+                    level -= 1;
+
+                    s.left[level] = &*self.head;
+                    s.right[level] = Shared::null();
+                }
+
                 // The current node we're at.
                 let mut node = &*self.head;
 
                 // Traverse the skip list from the highest to the lowest level.
-                for level in (0..MAX_HEIGHT).rev() {
+                while level >= 1 {
+                    level -= 1;
+
                     let mut pred = node;
                     let mut curr = pred.tower(level).load(SeqCst, guard);
 
@@ -409,6 +427,7 @@ where
 
             // Create a new node.
             let height = self.random_height();
+
             let (node, n) = {
                 let n = Node::<K, V>::alloc(height);
 
