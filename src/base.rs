@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
 
 use epoch::{self, Atomic, Guard, Shared};
+use utils::cache_padded::CachePadded;
 
 /// Maximum height of a skip list tower.
 const MAX_HEIGHT: usize = 32;
@@ -15,9 +16,6 @@ const HEIGHT_BITS: usize = 5;
 
 /// The bits of `refs_and_height` that keep the height.
 const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
-
-/// Number of iteration steps after which we repin the current thread.
-const REPIN_STEPS: usize = 128;
 
 /// A skip list node.
 ///
@@ -178,18 +176,22 @@ impl<K, V> Node<K, V> {
     }
 }
 
-// TODO
-// struct Metadata {
-//     seed: AtomicUsize,
-//     len: AtomicUsize,
-// }
+/// Often modified metadata associated with a skip list.
+struct Metadata {
+    /// The seed for random height generation.
+    seed: AtomicUsize,
+
+    /// The number of entries in the skip list.
+    len: AtomicUsize,
+}
 
 pub struct SkipList<K, V> {
     /// The head of the skip list (just a dummy node, not a real entry).
     head: *const Node<K, V>,
 
-    // metadata: Metadata,
-    seed: AtomicUsize,
+    /// Metadata associated with the skip list, stored in a dedicated cache line.
+    metadata: Box<CachePadded<Metadata>>,
+
     // TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
     // create a custom collector, otherwise use the default one. Then we can also remove the
     // `K: 'static` bound.
@@ -203,8 +205,23 @@ impl<K, V> SkipList<K, V> {
     pub fn new() -> SkipList<K, V> {
         SkipList {
             head: unsafe { Node::alloc(MAX_HEIGHT) },
-            seed: AtomicUsize::new(1),
+            metadata: Box::new(CachePadded::new(Metadata {
+                seed: AtomicUsize::new(1),
+                len: AtomicUsize::new(0),
+            })),
         }
+    }
+
+    /// Returns `true` if the skip list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of entries in the map.
+    ///
+    /// The returned number is just an approximation if the map is being concurrently modified.
+    pub fn len(&self) -> usize {
+        self.metadata.len.load(SeqCst)
     }
 }
 
@@ -212,58 +229,6 @@ impl<K, V> SkipList<K, V>
 where
     K: Ord,
 {
-    /// Returns `true` if the skip list is empty.
-    pub fn is_empty(&self) -> bool {
-        unsafe {
-            if (*self.head)
-                .tower(0)
-                .load(SeqCst, epoch::unprotected())
-                .is_null()
-            {
-                return true;
-            }
-
-            let guard = &epoch::pin();
-
-            loop {
-                let head = &*self.head;
-                let ptr = head.tower(0).load(SeqCst, guard);
-
-                match ptr.as_ref() {
-                    None => return true,
-                    Some(n) => {
-                        if n.is_removed() {
-                            self.search(Some(&n.key), guard);
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Iterates over the skip list and returns the number of traversed elements.
-    pub fn count(&self) -> usize {
-        let guard = &mut epoch::pin();
-        let mut count = 0;
-
-        if let Some(mut entry) = self.front() {
-            loop {
-                count += 1;
-                if count % REPIN_STEPS == 0 {
-                    guard.repin();
-                }
-
-                if !entry.next() {
-                    break;
-                }
-            }
-        }
-
-        count
-    }
-
     /// Returns the entry with the smallest key.
     pub fn front(&self) -> Option<Entry<K, V>> {
         let guard = &epoch::pin();
@@ -308,19 +273,18 @@ where
     /// Generates a random height and returns it.
     fn random_height(&self) -> usize {
         // From "Xorshift RNGs" by George Marsaglia.
-        let mut num = self.seed.load(Relaxed);
+        let mut num = self.metadata.seed.load(Relaxed);
         num ^= num << 13;
         num ^= num >> 17;
         num ^= num << 5;
-        self.seed.store(num, Relaxed);
+        self.metadata.seed.store(num, Relaxed);
 
         let mut height = num.trailing_zeros() as usize + 1;
         unsafe {
-            let guard = epoch::unprotected();
             while height >= 4
                 && (*self.head)
                     .tower(height - 2)
-                    .load(Relaxed, guard)
+                    .load(Relaxed, epoch::unprotected())
                     .is_null()
             {
                 height -= 1;
@@ -441,7 +405,9 @@ where
                 let r = search.right[0];
 
                 if replace {
-                    r.deref().mark_tower();
+                    if r.deref().mark_tower() {
+                        self.metadata.len.fetch_sub(1, SeqCst);
+                    }
                 } else {
                     // Try incrementing its reference count.
                     if Node::increment(r.as_raw()) {
@@ -471,6 +437,9 @@ where
 
                 (Shared::<Node<K, V>>::from(n as *const _), &*n)
             };
+
+            // Optimistically increment `len`.
+            self.metadata.len.fetch_add(1, SeqCst);
 
             loop {
                 // Set the lowest successor of `n` to `search.right[0]`.
@@ -502,7 +471,9 @@ where
                     let r = search.right[0];
 
                     if replace {
-                        r.deref().mark_tower();
+                        if r.deref().mark_tower() {
+                            self.metadata.len.fetch_sub(1, SeqCst);
+                        }
                     } else {
                         // Try incrementing its reference count.
                         if Node::increment(r.as_raw()) {
@@ -512,6 +483,7 @@ where
                             ptr::drop_in_place(&mut (*raw).key);
                             ptr::drop_in_place(&mut (*raw).value);
                             Node::dealloc(raw);
+                            self.metadata.len.fetch_sub(1, SeqCst);
 
                             return Entry::from_raw(self, r.as_raw());
                         }
@@ -699,38 +671,40 @@ where
 
             unsafe {
                 let n = node.deref();
-
                 if !Node::increment(n) {
                     continue;
                 }
 
                 let entry = Entry::from_raw(self, n);
 
-                if !n.mark_tower() {
-                    continue;
-                }
+                if n.mark_tower() {
+                    self.metadata.len.fetch_sub(1, SeqCst);
 
-                for level in (0..n.height()).rev() {
-                    let succ = n.tower(level).load(SeqCst, guard).with_tag(0);
+                    for level in (0..n.height()).rev() {
+                        let succ = n.tower(level).load(SeqCst, guard).with_tag(0);
 
-                    if search.left[level]
-                        .tower(level)
-                        .compare_and_set(node, succ, SeqCst, guard)
-                        .is_ok()
-                    {
-                        Node::decrement(n);
-                    } else {
-                        self.search(Some(key), guard);
-                        break;
+                        if search.left[level]
+                            .tower(level)
+                            .compare_and_set(node, succ, SeqCst, guard)
+                            .is_ok()
+                        {
+                            Node::decrement(n);
+                        } else {
+                            self.search(Some(key), guard);
+                            break;
+                        }
                     }
-                }
 
-                return Some(entry);
+                    return Some(entry);
+                }
             }
         }
     }
 
     pub fn clear(&self) {
+        /// Number of iteration steps after which we repin the current thread.
+        const REPIN_STEPS: usize = 128;
+
         let guard = &mut epoch::pin();
 
         let mut count = 0;
@@ -743,7 +717,9 @@ where
                 }
 
                 let next = entry.get_next();
-                entry.node.mark_tower();
+                if entry.node.mark_tower() {
+                    self.metadata.len.fetch_sub(1, SeqCst);
+                }
 
                 match next {
                     None => break,
@@ -938,6 +914,7 @@ where
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
         if self.node.mark_tower() {
+            self.parent.metadata.len.fetch_sub(1, SeqCst);
             let guard = &epoch::pin();
             self.parent.search(Some(&self.node.key), guard);
             true
@@ -1197,6 +1174,14 @@ mod tests {
         e.prev();
         e.next();
         assert_ne!(*e.key(), 7);
+
+        for e in s.iter() {
+            assert!(!s.is_empty());
+            assert_ne!(s.len(), 0);
+            e.remove();
+        }
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
     }
 
     #[test]
@@ -1219,27 +1204,27 @@ mod tests {
     }
 
     #[test]
-    fn count() {
+    fn len() {
         let insert = [4, 2, 12, 8, 7, 11, 5];
         let s = SkipList::new();
-        assert_eq!(s.count(), 0);
+        assert_eq!(s.len(), 0);
 
         for (i, &x) in [4, 2, 12, 8, 7, 11, 5].iter().enumerate() {
             s.insert(x, x * 10);
-            assert_eq!(s.count(), i + 1);
+            assert_eq!(s.len(), i + 1);
         }
 
         s.insert(5, 0);
-        assert_eq!(s.count(), 7);
+        assert_eq!(s.len(), 7);
         s.insert(5, 0);
-        assert_eq!(s.count(), 7);
+        assert_eq!(s.len(), 7);
 
         s.remove(&6);
-        assert_eq!(s.count(), 7);
+        assert_eq!(s.len(), 7);
         s.remove(&5);
-        assert_eq!(s.count(), 6);
+        assert_eq!(s.len(), 6);
         s.remove(&12);
-        assert_eq!(s.count(), 5);
+        assert_eq!(s.len(), 5);
     }
 
     #[test]
@@ -1446,8 +1431,10 @@ mod tests {
         }
 
         assert!(!s.is_empty());
+        assert_ne!(s.len(), 0);
         s.clear();
         assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
     }
 
     #[test]
@@ -1486,7 +1473,8 @@ mod tests {
 
         drop(s);
 
-        // TODO(stjepang): When we get per-SkipList collectors, this for loop will be unnecessary.
+        // TODO(stjepang): When we get per-SkipList collectors, this for loop will become
+        // unnecessary.
         for _ in 0..1000 {
             ::epoch::pin().flush();
         }

@@ -18,22 +18,24 @@ impl<K, V> SkipMap<K, V> {
             inner: base::SkipList::new(),
         }
     }
+
+    /// Returns `true` if the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the number of entries in the map.
+    ///
+    /// The returned number is just an approximation if the map is being concurrently modified.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
 }
 
 impl<K, V> SkipMap<K, V>
 where
     K: Ord,
 {
-    /// Returns `true` if the map is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Iterates over the map and returns the number of traversed elements.
-    pub fn count(&self) -> usize {
-        self.inner.count()
-    }
-
     /// Returns the entry with the smallest key.
     pub fn front(&self) -> Option<Entry<K, V>> {
         self.inner.front().map(Entry::new)
