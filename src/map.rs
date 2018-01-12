@@ -122,8 +122,7 @@ impl<K, V> Default for SkipMap<K, V> {
 
 impl<K, V> fmt::Debug for SkipMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO(stjepang): Iterate over all elements (see `BTreeMap`).
-        f.debug_struct("SkipMap").finish()
+        write!(f, "SkipMap {{ ... }}")
     }
 }
 
@@ -235,8 +234,6 @@ impl<'a, K, V> Clone for Entry<'a, K, V> {
     }
 }
 
-// TODO: Eq, Ord for Entry?
-
 impl<'a, K, V> fmt::Debug for Entry<'a, K, V>
 where
     K: fmt::Debug,
@@ -269,7 +266,7 @@ where
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("IntoIter").finish()
+        write!(f, "IntoIter {{ ... }}")
     }
 }
 
@@ -303,7 +300,7 @@ where
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Iter").finish()
+        write!(f, "Iter {{ ... }}")
     }
 }
 

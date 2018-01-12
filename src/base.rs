@@ -1,9 +1,7 @@
 use std::borrow::Borrow;
-use std::fmt;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epoch::{self, Atomic, Guard, Shared};
 use utils::cache_padded::CachePadded;
@@ -83,7 +81,7 @@ impl<K, V> Node<K, V> {
     /// Returns the height of this node's tower.
     #[inline]
     fn height(&self) -> usize {
-        (self.refs_and_height.load(Relaxed) & HEIGHT_MASK) + 1
+        (self.refs_and_height.load(Ordering::Relaxed) & HEIGHT_MASK) + 1
     }
 
     #[inline]
@@ -102,7 +100,7 @@ impl<K, V> Node<K, V> {
             return true;
         }
 
-        let mut old = (*ptr).refs_and_height.load(Relaxed);
+        let mut old = (*ptr).refs_and_height.load(Ordering::Relaxed);
         loop {
             if old & !HEIGHT_MASK == 0 {
                 return false;
@@ -115,8 +113,8 @@ impl<K, V> Node<K, V> {
             match (*ptr).refs_and_height.compare_exchange_weak(
                 old,
                 old + (1 << HEIGHT_BITS),
-                AcqRel,
-                Acquire,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
                 Err(o) => old = o,
@@ -129,7 +127,10 @@ impl<K, V> Node<K, V> {
         let height = self.height();
 
         for level in (0..height).rev() {
-            let next = unsafe { self.tower(level).fetch_or(1, SeqCst, epoch::unprotected()) };
+            let next = unsafe {
+                self.tower(level)
+                    .fetch_or(1, Ordering::SeqCst, epoch::unprotected())
+            };
 
             if level == 0 && next.tag() == 1 {
                 return false;
@@ -141,7 +142,11 @@ impl<K, V> Node<K, V> {
 
     /// Returns `true` if this node is removed.
     fn is_removed(&self) -> bool {
-        unsafe { self.tower(0).load(SeqCst, epoch::unprotected()).tag() == 1 }
+        unsafe {
+            self.tower(0)
+                .load(Ordering::SeqCst, epoch::unprotected())
+                .tag() == 1
+        }
     }
 
     /// Decrements the reference counter of a node, scheduling it for GC if the count becomes zero.
@@ -150,7 +155,9 @@ impl<K, V> Node<K, V> {
     #[inline]
     unsafe fn decrement(ptr: *const Self) {
         if let Some(node) = ptr.as_ref() {
-            if node.refs_and_height.fetch_sub(1 << HEIGHT_BITS, AcqRel) >> HEIGHT_BITS == 1 {
+            if node.refs_and_height
+                .fetch_sub(1 << HEIGHT_BITS, Ordering::AcqRel) >> HEIGHT_BITS == 1
+            {
                 Self::finalize(ptr);
             }
         }
@@ -191,7 +198,6 @@ pub struct SkipList<K, V> {
 
     /// Metadata associated with the skip list, stored in a dedicated cache line.
     metadata: Box<CachePadded<Metadata>>,
-
     // TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
     // create a custom collector, otherwise use the default one. Then we can also remove the
     // `K: 'static` bound.
@@ -221,7 +227,7 @@ impl<K, V> SkipList<K, V> {
     ///
     /// The returned number is just an approximation if the map is being concurrently modified.
     pub fn len(&self) -> usize {
-        self.metadata.len.load(SeqCst)
+        self.metadata.len.load(Ordering::SeqCst)
     }
 }
 
@@ -236,7 +242,7 @@ where
         loop {
             unsafe {
                 let head = &*self.head;
-                let ptr = head.tower(0).load(SeqCst, guard);
+                let ptr = head.tower(0).load(Ordering::SeqCst, guard);
 
                 match ptr.as_ref() {
                     None => return None,
@@ -273,18 +279,18 @@ where
     /// Generates a random height and returns it.
     fn random_height(&self) -> usize {
         // From "Xorshift RNGs" by George Marsaglia.
-        let mut num = self.metadata.seed.load(Relaxed);
+        let mut num = self.metadata.seed.load(Ordering::Relaxed);
         num ^= num << 13;
         num ^= num >> 17;
         num ^= num << 5;
-        self.metadata.seed.store(num, Relaxed);
+        self.metadata.seed.store(num, Ordering::Relaxed);
 
         let mut height = num.trailing_zeros() as usize + 1;
         unsafe {
             while height >= 4
                 && (*self.head)
                     .tower(height - 2)
-                    .load(Relaxed, epoch::unprotected())
+                    .load(Ordering::Relaxed, epoch::unprotected())
                     .is_null()
             {
                 height -= 1;
@@ -308,7 +314,12 @@ where
             'search: loop {
                 let mut level = MAX_HEIGHT;
 
-                while level >= 1 && (*self.head).tower(level - 1).load(SeqCst, guard).is_null() {
+                while level >= 1
+                    && (*self.head)
+                        .tower(level - 1)
+                        .load(Ordering::SeqCst, guard)
+                        .is_null()
+                {
                     level -= 1;
 
                     s.left[level] = &*self.head;
@@ -323,7 +334,7 @@ where
                     level -= 1;
 
                     let mut pred = node;
-                    let mut curr = pred.tower(level).load(SeqCst, guard);
+                    let mut curr = pred.tower(level).load(Ordering::SeqCst, guard);
 
                     // If `curr` is marked, that means `pred` is deleted and we have to restart the
                     // search.
@@ -334,7 +345,7 @@ where
                     // Iterate through the current level until we reach a node with a key greater
                     // than or equal to `key`.
                     while let Some(c) = curr.as_ref() {
-                        let succ = c.tower(level).load(SeqCst, guard);
+                        let succ = c.tower(level).load(Ordering::SeqCst, guard);
 
                         if succ.tag() == 1 {
                             // If `succ` is marked, that means `curr` is deleted. Let's try
@@ -342,7 +353,7 @@ where
                             match pred.tower(level).compare_and_set(
                                 curr,
                                 succ.with_tag(0),
-                                SeqCst,
+                                Ordering::SeqCst,
                                 guard,
                             ) {
                                 Ok(_) => {
@@ -406,7 +417,7 @@ where
 
                 if replace {
                     if r.deref().mark_tower() {
-                        self.metadata.len.fetch_sub(1, SeqCst);
+                        self.metadata.len.fetch_sub(1, Ordering::SeqCst);
                     }
                 } else {
                     // Try incrementing its reference count.
@@ -433,22 +444,23 @@ where
                 // The reference count is initially zero. Let's increment it twice to account for:
                 // 1. The entry that will be returned.
                 // 2. The link at the level 0 of the tower.
-                (*n).refs_and_height.fetch_add(2 << HEIGHT_BITS, Relaxed);
+                (*n).refs_and_height
+                    .fetch_add(2 << HEIGHT_BITS, Ordering::Relaxed);
 
                 (Shared::<Node<K, V>>::from(n as *const _), &*n)
             };
 
             // Optimistically increment `len`.
-            self.metadata.len.fetch_add(1, SeqCst);
+            self.metadata.len.fetch_add(1, Ordering::SeqCst);
 
             loop {
                 // Set the lowest successor of `n` to `search.right[0]`.
-                n.tower(0).store(search.right[0], SeqCst);
+                n.tower(0).store(search.right[0], Ordering::SeqCst);
 
                 // Try installing the new node into the skip list.
                 if search.left[0]
                     .tower(0)
-                    .compare_and_set(search.right[0], node, SeqCst, guard)
+                    .compare_and_set(search.right[0], node, Ordering::SeqCst, guard)
                     .is_ok()
                 {
                     break;
@@ -472,7 +484,7 @@ where
 
                     if replace {
                         if r.deref().mark_tower() {
-                            self.metadata.len.fetch_sub(1, SeqCst);
+                            self.metadata.len.fetch_sub(1, Ordering::SeqCst);
                         }
                     } else {
                         // Try incrementing its reference count.
@@ -483,7 +495,7 @@ where
                             ptr::drop_in_place(&mut (*raw).key);
                             ptr::drop_in_place(&mut (*raw).value);
                             Node::dealloc(raw);
-                            self.metadata.len.fetch_sub(1, SeqCst);
+                            self.metadata.len.fetch_sub(1, Ordering::SeqCst);
 
                             return Entry::from_raw(self, r.as_raw());
                         }
@@ -504,7 +516,7 @@ where
                     let succ = search.right[level];
 
                     // Load the current value of the pointer in the tower.
-                    let next = n.tower(level).load(SeqCst, guard);
+                    let next = n.tower(level).load(Ordering::SeqCst, guard);
 
                     // If the current pointer is marked, that means another thread is already
                     // deleting the node we've just inserted. In that case, let's just stop
@@ -539,7 +551,7 @@ where
                     // operation fails, that means another thread has marked the pointer and we
                     // should stop building the tower.
                     if n.tower(level)
-                        .compare_and_set(next, succ, SeqCst, guard)
+                        .compare_and_set(next, succ, Ordering::SeqCst, guard)
                         .is_err()
                     {
                         break 'build;
@@ -547,11 +559,12 @@ where
 
                     // Increment the reference count. The current value will always be at least 1
                     // because we are holding
-                    (*n).refs_and_height.fetch_add(1 << HEIGHT_BITS, Relaxed);
+                    (*n).refs_and_height
+                        .fetch_add(1 << HEIGHT_BITS, Ordering::Relaxed);
 
                     // Try installing the new node at the current level.
                     if pred.tower(level)
-                        .compare_and_set(succ, node, SeqCst, guard)
+                        .compare_and_set(succ, node, Ordering::SeqCst, guard)
                         .is_ok()
                     {
                         // Success! Continue on the next level.
@@ -559,7 +572,8 @@ where
                     }
 
                     // Installation failed. Decrement the reference count.
-                    (*n).refs_and_height.fetch_sub(1 << HEIGHT_BITS, Relaxed);
+                    (*n).refs_and_height
+                        .fetch_sub(1 << HEIGHT_BITS, Ordering::Relaxed);
 
                     // We don't have the most up-to-date search results. Repeat the search.
                     //
@@ -577,7 +591,7 @@ where
             // that we installed the new node at one of the higher levels. In order to undo that
             // installation, we must repeat the search, which will unlink the new node at that
             // level.
-            if n.tower(height - 1).load(SeqCst, guard).tag() == 1 {
+            if n.tower(height - 1).load(Ordering::SeqCst, guard).tag() == 1 {
                 self.search(Some(&n.key), guard);
             }
 
@@ -678,14 +692,14 @@ where
                 let entry = Entry::from_raw(self, n);
 
                 if n.mark_tower() {
-                    self.metadata.len.fetch_sub(1, SeqCst);
+                    self.metadata.len.fetch_sub(1, Ordering::SeqCst);
 
                     for level in (0..n.height()).rev() {
-                        let succ = n.tower(level).load(SeqCst, guard).with_tag(0);
+                        let succ = n.tower(level).load(Ordering::SeqCst, guard).with_tag(0);
 
                         if search.left[level]
                             .tower(level)
-                            .compare_and_set(node, succ, SeqCst, guard)
+                            .compare_and_set(node, succ, Ordering::SeqCst, guard)
                             .is_ok()
                         {
                             Node::decrement(n);
@@ -718,7 +732,7 @@ where
 
                 let next = entry.get_next();
                 if entry.node.mark_tower() {
-                    self.metadata.len.fetch_sub(1, SeqCst);
+                    self.metadata.len.fetch_sub(1, Ordering::SeqCst);
                 }
 
                 match next {
@@ -743,7 +757,9 @@ impl<K, V> Drop for SkipList<K, V> {
                     ptr::drop_in_place(&mut (*node).value);
                 }
 
-                let next = (*node).tower(0).load(Relaxed, epoch::unprotected());
+                let next = (*node)
+                    .tower(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
                 Node::dealloc(node);
                 node = next.as_raw() as *mut Node<K, V>;
             }
@@ -759,11 +775,13 @@ impl<K, V> IntoIterator for SkipList<K, V> {
         unsafe {
             let next = (*self.head)
                 .tower(0)
-                .load(Relaxed, epoch::unprotected())
+                .load(Ordering::Relaxed, epoch::unprotected())
                 .as_raw();
 
             for level in 0..MAX_HEIGHT {
-                (*self.head).tower(level).store(Shared::null(), Relaxed);
+                (*self.head)
+                    .tower(level)
+                    .store(Shared::null(), Ordering::Relaxed);
             }
 
             IntoIter {
@@ -799,10 +817,6 @@ unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
 impl<'a, K, V> Entry<'a, K, V> {
-    fn new(parent: &'a SkipList<K, V>, node: &'a Node<K, V>) -> Self {
-        Entry { parent, node }
-    }
-
     unsafe fn from_raw(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
         Entry {
             parent,
@@ -858,13 +872,16 @@ where
         loop {
             unsafe {
                 let succ = {
-                    let succ = self.node.tower(0).load(SeqCst, guard);
+                    let succ = self.node.tower(0).load(Ordering::SeqCst, guard);
                     if succ.tag() == 0 {
                         succ
                     } else {
                         let search = self.parent.search(Some(&self.node.key), guard);
                         if search.found {
-                            search.right[0].deref().tower(0).load(SeqCst, guard)
+                            search.right[0]
+                                .deref()
+                                .tower(0)
+                                .load(Ordering::SeqCst, guard)
                         } else {
                             search.right[0]
                         }
@@ -914,7 +931,7 @@ where
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
         if self.node.mark_tower() {
-            self.parent.metadata.len.fetch_sub(1, SeqCst);
+            self.parent.metadata.len.fetch_sub(1, Ordering::SeqCst);
             let guard = &epoch::pin();
             self.parent.search(Some(&self.node.key), guard);
             true
@@ -959,7 +976,9 @@ impl<K, V> Iterator for IntoIter<K, V> {
                 let key = ptr::read(&mut (*self.node).key);
                 let value = ptr::read(&mut (*self.node).value);
 
-                let next = (*self.node).tower(0).load(Relaxed, epoch::unprotected());
+                let next = (*self.node)
+                    .tower(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
                 self.node = next.as_raw() as *mut Node<K, V>;
 
                 if next.tag() == 0 {
@@ -1047,12 +1066,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::thread;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::SkipList;
 
@@ -1205,7 +1219,6 @@ mod tests {
 
     #[test]
     fn len() {
-        let insert = [4, 2, 12, 8, 7, 11, 5];
         let s = SkipList::new();
         assert_eq!(s.len(), 0);
 
@@ -1447,7 +1460,7 @@ mod tests {
 
         impl Drop for Key {
             fn drop(&mut self) {
-                KEYS.fetch_add(1, SeqCst);
+                KEYS.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -1455,7 +1468,7 @@ mod tests {
 
         impl Drop for Value {
             fn drop(&mut self) {
-                VALUES.fetch_add(1, SeqCst);
+                VALUES.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -1463,13 +1476,13 @@ mod tests {
         for &x in &[4, 2, 12, 8, 7, 11, 5] {
             s.insert(Key(x), Value);
         }
-        assert_eq!(KEYS.load(SeqCst), 0);
-        assert_eq!(VALUES.load(SeqCst), 0);
+        assert_eq!(KEYS.load(Ordering::SeqCst), 0);
+        assert_eq!(VALUES.load(Ordering::SeqCst), 0);
 
         let key7 = Key(7);
         s.remove(&key7);
-        assert_eq!(KEYS.load(SeqCst), 0);
-        assert_eq!(VALUES.load(SeqCst), 1);
+        assert_eq!(KEYS.load(Ordering::SeqCst), 0);
+        assert_eq!(VALUES.load(Ordering::SeqCst), 1);
 
         drop(s);
 
@@ -1479,7 +1492,7 @@ mod tests {
             ::epoch::pin().flush();
         }
 
-        assert_eq!(KEYS.load(SeqCst), 7);
-        assert_eq!(VALUES.load(SeqCst), 7);
+        assert_eq!(KEYS.load(Ordering::SeqCst), 7);
+        assert_eq!(VALUES.load(Ordering::SeqCst), 7);
     }
 }
