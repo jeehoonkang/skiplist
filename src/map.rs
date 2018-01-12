@@ -4,6 +4,9 @@ use std::iter::FromIterator;
 
 use base;
 
+// TODO: pop_front
+// TODO: pop_back
+
 pub struct SkipMap<K, V> {
     inner: base::SkipList<K, V>,
 }
@@ -74,7 +77,9 @@ where
 
     /// TODO
     pub fn iter(&self) -> Iter<K, V> {
-        Iter { inner: self.inner.iter() }
+        Iter {
+            inner: self.inner.iter(),
+        }
     }
 
     // TODO: `pub fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` (double ended iterator)
@@ -147,7 +152,10 @@ impl<K, V> FromIterator<(K, V)> for SkipMap<K, V>
 where
     K: Ord,
 {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> SkipMap<K, V> {
+    fn from_iter<I>(iter: I) -> SkipMap<K, V>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
         let s = SkipMap::new();
         for (k, v) in iter {
             s.get_or_insert(k, v);
@@ -259,12 +267,10 @@ where
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO(stjepang): Iterate over all elements (see `btree_map::IntoIter`).
         f.debug_struct("IntoIter").finish()
     }
 }
 
-// TODO: impl DoubleEndedIterator
 pub struct Iter<'a, K: 'a, V: 'a> {
     inner: base::Iter<'a, K, V>,
 }
@@ -280,13 +286,21 @@ where
     }
 }
 
+impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V>
+where
+    K: Ord,
+{
+    fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
+        self.inner.next_back().map(Entry::new)
+    }
+}
+
 impl<'a, K, V> fmt::Debug for Iter<'a, K, V>
 where
     K: fmt::Debug,
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO(stjepang): Iterate over all elements (see `btree_map::Iter`).
         f.debug_struct("Iter").finish()
     }
 }

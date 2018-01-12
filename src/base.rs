@@ -16,6 +16,9 @@ const HEIGHT_BITS: usize = 5;
 /// The bits of `refs_and_height` that keep the height.
 const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
 
+/// Number of iteration steps after which we repin the current thread.
+const REPIN_STEPS: usize = 128;
+
 /// A skip list node.
 ///
 /// This struct is marked with `repr(C)` so that the specific order of fields can be enforced.
@@ -111,10 +114,12 @@ impl<K, V> Node<K, V> {
                 panic!("reference count overflow");
             }
 
-            match (*ptr)
-                .refs_and_height
-                .compare_exchange_weak(old, old + (1 << HEIGHT_BITS), AcqRel, Acquire)
-            {
+            match (*ptr).refs_and_height.compare_exchange_weak(
+                old,
+                old + (1 << HEIGHT_BITS),
+                AcqRel,
+                Acquire,
+            ) {
                 Ok(_) => return true,
                 Err(o) => old = o,
             }
@@ -126,8 +131,7 @@ impl<K, V> Node<K, V> {
         let height = self.height();
 
         for level in (0..height).rev() {
-            let next =
-                unsafe { self.tower(level).fetch_or(1, SeqCst, epoch::unprotected()) };
+            let next = unsafe { self.tower(level).fetch_or(1, SeqCst, epoch::unprotected()) };
 
             if level == 0 && next.tag() == 1 {
                 return false;
@@ -174,11 +178,21 @@ impl<K, V> Node<K, V> {
     }
 }
 
+// TODO
+// struct Metadata {
+//     seed: AtomicUsize,
+//     len: AtomicUsize,
+// }
+
 pub struct SkipList<K, V> {
-    head: *const Node<K, V>, // !Send + !Sync
+    /// The head of the skip list (just a dummy node, not a real entry).
+    head: *const Node<K, V>,
+
+    // metadata: Metadata,
     seed: AtomicUsize,
-    // TODO: Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`, create a
-    // custom collector, otherwise use the default one. Then we can remove the `K: 'static` bound.
+    // TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
+    // create a custom collector, otherwise use the default one. Then we can also remove the
+    // `K: 'static` bound.
 }
 
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for SkipList<K, V> {}
@@ -201,7 +215,11 @@ where
     /// Returns `true` if the skip list is empty.
     pub fn is_empty(&self) -> bool {
         unsafe {
-            if (*self.head).tower(0).load(SeqCst, epoch::unprotected()).is_null() {
+            if (*self.head)
+                .tower(0)
+                .load(SeqCst, epoch::unprotected())
+                .is_null()
+            {
                 return true;
             }
 
@@ -233,7 +251,7 @@ where
         if let Some(mut entry) = self.front() {
             loop {
                 count += 1;
-                if count % 128 == 0 {
+                if count % REPIN_STEPS == 0 {
                     guard.repin();
                 }
 
@@ -299,7 +317,12 @@ where
         let mut height = num.trailing_zeros() as usize + 1;
         unsafe {
             let guard = epoch::unprotected();
-            while height >= 4 && (*self.head).tower(height - 2).load(Relaxed, guard).is_null() {
+            while height >= 4
+                && (*self.head)
+                    .tower(height - 2)
+                    .load(Relaxed, guard)
+                    .is_null()
+            {
                 height -= 1;
             }
         }
@@ -454,7 +477,8 @@ where
                 n.tower(0).store(search.right[0], SeqCst);
 
                 // Try installing the new node into the skip list.
-                if search.left[0].tower(0)
+                if search.left[0]
+                    .tower(0)
                     .compare_and_set(search.right[0], node, SeqCst, guard)
                     .is_ok()
                 {
@@ -642,7 +666,8 @@ where
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
             parent: self,
-            entry: None,
+            front: None,
+            back: None,
             finished: false,
         }
     }
@@ -688,7 +713,8 @@ where
                 for level in (0..n.height()).rev() {
                     let succ = n.tower(level).load(SeqCst, guard).with_tag(0);
 
-                    if search.left[level].tower(level)
+                    if search.left[level]
+                        .tower(level)
                         .compare_and_set(node, succ, SeqCst, guard)
                         .is_ok()
                     {
@@ -712,7 +738,7 @@ where
         if let Some(mut entry) = self.front() {
             loop {
                 count += 1;
-                if count % 128 == 0 {
+                if count % REPIN_STEPS == 0 {
                     guard.repin();
                 }
 
@@ -724,7 +750,6 @@ where
                     Some(e) => entry = e,
                 }
             }
-
         }
 
         self.search(None, guard);
@@ -756,7 +781,8 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 
     fn into_iter(self) -> IntoIter<K, V> {
         unsafe {
-            let next = (*self.head).tower(0)
+            let next = (*self.head)
+                .tower(0)
                 .load(Relaxed, epoch::unprotected())
                 .as_raw();
 
@@ -798,10 +824,7 @@ unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
 impl<'a, K, V> Entry<'a, K, V> {
     fn new(parent: &'a SkipList<K, V>, node: &'a Node<K, V>) -> Self {
-        Entry {
-            parent,
-            node,
-        }
+        Entry { parent, node }
     }
 
     unsafe fn from_raw(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
@@ -942,21 +965,6 @@ impl<'a, K, V> Clone for Entry<'a, K, V> {
     }
 }
 
-// TODO: impl Debug for Iter and so on.
-
-impl<'a, K, V> fmt::Debug for Entry<'a, K, V>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("Entry")
-            .field(&self.key())
-            .field(&self.value())
-            .finish()
-    }
-}
-
 pub struct IntoIter<K, V> {
     node: *mut Node<K, V>,
 }
@@ -985,10 +993,10 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
-// TODO: impl DoubleEndedIterator
 pub struct Iter<'a, K: 'a, V: 'a> {
     parent: &'a SkipList<K, V>,
-    entry: Option<Entry<'a, K, V>>,
+    front: Option<Entry<'a, K, V>>,
+    back: Option<Entry<'a, K, V>>,
     finished: bool,
 }
 
@@ -1002,33 +1010,74 @@ where
         if self.finished {
             None
         } else {
-            if let Some(e) = self.entry.as_mut() {
-                if e.next() {
-                    return Some(e.clone());
-                } else {
+            if self.front.is_none() {
+                self.front = self.parent.front();
+            } else {
+                if !self.front.as_mut().unwrap().next() {
                     self.finished = true;
                     return None;
                 }
             }
 
-            self.entry = self.parent.front();
-            self.finished = self.entry.is_none();
-            self.entry.clone()
+            if let Some(f) = self.front.as_ref() {
+                if let Some(b) = self.back.as_ref() {
+                    if f.key() >= b.key() {
+                        self.finished = true;
+                        return None;
+                    }
+                }
+                Some(f.clone())
+            } else {
+                self.finished = true;
+                None
+            }
+        }
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V>
+where
+    K: Ord,
+{
+    fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
+        if self.finished {
+            None
+        } else {
+            if self.back.is_none() {
+                self.back = self.parent.back();
+            } else {
+                if !self.back.as_mut().unwrap().prev() {
+                    self.finished = true;
+                    return None;
+                }
+            }
+
+            if let Some(b) = self.back.as_ref() {
+                if let Some(f) = self.front.as_ref() {
+                    if f.key() >= b.key() {
+                        self.finished = true;
+                        return None;
+                    }
+                }
+                Some(b.clone())
+            } else {
+                self.finished = true;
+                None
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     use std::ptr;
 
-    // TODO: random panics
-    // TODO: test with broken ordering
+    use super::SkipList;
 
     #[test]
     fn new() {
@@ -1078,17 +1127,16 @@ mod tests {
         let insert = [0, 4, 2, 12, 8, 7, 11, 5];
         let not_present = [1, 3, 6, 9, 10];
         let remove = [2, 12, 8];
+        let remaining = [0, 4, 5, 7, 11];
 
         let s = SkipList::new();
 
         for &x in &insert {
             s.insert(x, x * 10);
         }
-
         for x in &not_present {
             assert!(s.remove(x).is_none());
         }
-
         for x in &remove {
             assert!(s.remove(x).is_some());
         }
@@ -1101,12 +1149,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(v, [0, 4, 5, 7, 11]);
 
+        assert_eq!(v, remaining);
         for x in &insert {
             s.remove(x);
         }
-
         assert!(s.is_empty());
     }
 
@@ -1117,8 +1164,7 @@ mod tests {
         assert!(s.front().is_none());
         assert!(s.back().is_none());
 
-        let insert = [4, 2, 12, 8, 7, 11, 5];
-        for &x in &insert {
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
             s.insert(x, x * 10);
         }
 
@@ -1139,8 +1185,7 @@ mod tests {
     fn entry_remove() {
         let s = SkipList::new();
 
-        let insert = [4, 2, 12, 8, 7, 11, 5];
-        for &x in &insert {
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
             s.insert(x, x * 10);
         }
 
@@ -1158,8 +1203,7 @@ mod tests {
     fn entry_reposition() {
         let s = SkipList::new();
 
-        let insert = [4, 2, 12, 8, 7, 11, 5];
-        for &x in &insert {
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
             s.insert(x, x * 10);
         }
 
@@ -1180,7 +1224,7 @@ mod tests {
         let s = SkipList::new();
         assert_eq!(s.count(), 0);
 
-        for (i, &x) in insert.iter().enumerate() {
+        for (i, &x) in [4, 2, 12, 8, 7, 11, 5].iter().enumerate() {
             s.insert(x, x * 10);
             assert_eq!(s.count(), i + 1);
         }
@@ -1331,21 +1375,123 @@ mod tests {
 
     #[test]
     fn front_and_back() {
-        // TODO
+        let s = SkipList::new();
+        assert!(s.front().is_none());
+        assert!(s.back().is_none());
+
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert_eq!(*s.front().unwrap().key(), 2);
+        assert_eq!(*s.back().unwrap().key(), 12);
     }
 
     #[test]
     fn iter() {
-        // TODO
-        // TODO: descending
+        let s = SkipList::new();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert_eq!(
+            s.iter().map(|e| *e.key()).collect::<Vec<_>>(),
+            &[2, 4, 5, 7, 8, 11, 12]
+        );
+        assert_eq!(
+            s.iter().rev().map(|e| *e.key()).collect::<Vec<_>>(),
+            &[12, 11, 8, 7, 5, 4, 2]
+        );
+
+        let mut it = s.iter();
+        s.remove(&2);
+        assert_eq!(*it.next().unwrap().key(), 4);
+        assert_eq!(*it.next_back().unwrap().key(), 12);
+        s.remove(&7);
+        assert_eq!(*it.next().unwrap().key(), 5);
+        s.remove(&5);
+        assert_eq!(*it.next().unwrap().key(), 8);
+        assert_eq!(*it.next_back().unwrap().key(), 11);
+
+        assert!(it.next_back().is_none());
+        assert!(it.next().is_none());
     }
 
     #[test]
     fn into_iter() {
-        // TODO
-        // TODO: descending
+        let s = SkipList::new();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert_eq!(
+            s.into_iter().collect::<Vec<_>>(),
+            &[
+                (2, 20),
+                (4, 40),
+                (5, 50),
+                (7, 70),
+                (8, 80),
+                (11, 110),
+                (12, 120)
+            ]
+        );
     }
 
-    // TODO: drops
-    // TODO: clear
+    #[test]
+    fn clear() {
+        let s = SkipList::new();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert!(!s.is_empty());
+        s.clear();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn drops() {
+        static KEYS: AtomicUsize = AtomicUsize::new(0);
+        static VALUES: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Eq, PartialEq, Ord, PartialOrd)]
+        struct Key(i32);
+
+        impl Drop for Key {
+            fn drop(&mut self) {
+                KEYS.fetch_add(1, SeqCst);
+            }
+        }
+
+        struct Value;
+
+        impl Drop for Value {
+            fn drop(&mut self) {
+                VALUES.fetch_add(1, SeqCst);
+            }
+        }
+
+        let s = SkipList::new();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(Key(x), Value);
+        }
+        assert_eq!(KEYS.load(SeqCst), 0);
+        assert_eq!(VALUES.load(SeqCst), 0);
+
+        let key7 = Key(7);
+        s.remove(&key7);
+        assert_eq!(KEYS.load(SeqCst), 0);
+        assert_eq!(VALUES.load(SeqCst), 1);
+
+        drop(s);
+
+        // TODO(stjepang): When we get per-SkipList collectors, this for loop will be unnecessary.
+        for _ in 0..1000 {
+            ::epoch::pin().flush();
+        }
+
+        assert_eq!(KEYS.load(SeqCst), 7);
+        assert_eq!(VALUES.load(SeqCst), 7);
+    }
 }
