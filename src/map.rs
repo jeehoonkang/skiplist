@@ -4,8 +4,6 @@ use std::iter::FromIterator;
 
 use base;
 
-// TODO: len()
-
 pub struct SkipMap<K, V> {
     inner: base::SkipList<K, V>,
 }
@@ -21,7 +19,7 @@ impl<K, V> SkipMap<K, V> {
 
 impl<K, V> SkipMap<K, V>
 where
-    K: Ord + Send + 'static,
+    K: Ord,
 {
     /// Returns `true` if the map is empty.
     pub fn is_empty(&self) -> bool {
@@ -35,7 +33,7 @@ where
 
     /// Returns the entry with the smallest key.
     pub fn front(&self) -> Option<Entry<K, V>> {
-        self.inner.back().map(Entry::new)
+        self.inner.front().map(Entry::new)
     }
 
     /// Returns the entry with the largest key.
@@ -61,17 +59,37 @@ where
         self.inner.get(key).map(Entry::new)
     }
 
+    pub fn seek<Q>(&self, key: &Q) -> Option<Entry<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.inner.seek(key).map(Entry::new)
+    }
+
+    /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
+    pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
+        Entry::new(self.inner.get_or_insert(key, value))
+    }
+
+    /// TODO
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter { inner: self.inner.iter() }
+    }
+
+    // TODO: `pub fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` (double ended iterator)
+}
+
+impl<K, V> SkipMap<K, V>
+where
+    K: Ord + Send + 'static,
+{
     /// Inserts a key-value pair into the map and returns the new entry.
     ///
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
     pub fn insert(&self, key: K, value: V) -> Entry<K, V> {
-        Entry::new(self.inner.insert(key, value, true))
-    }
-
-    /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
-    pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
-        Entry::new(self.inner.insert(key, value, false))
+        Entry::new(self.inner.insert(key, value))
     }
 
     /// Removes an entry with the specified key from the map and returns it.
@@ -87,18 +105,6 @@ where
     pub fn clear(&self) {
         self.inner.clear();
     }
-
-    /// TODO
-    pub fn iter(&self) -> Iter<K, V> {
-        Iter {
-            parent: self,
-            entry: None,
-            finished: false,
-        }
-    }
-
-    // TODO:
-    // `pub fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` -> Entry<'a, K, V> (double ended iterator).
 }
 
 impl<K, V> Default for SkipMap<K, V> {
@@ -127,7 +133,7 @@ impl<K, V> IntoIterator for SkipMap<K, V> {
 
 impl<'a, K, V> IntoIterator for &'a SkipMap<K, V>
 where
-    K: Ord + Send + 'static,
+    K: Ord,
 {
     type Item = Entry<'a, K, V>;
     type IntoIter = Iter<'a, K, V>;
@@ -139,32 +145,25 @@ where
 
 impl<K, V> FromIterator<(K, V)> for SkipMap<K, V>
 where
-    K: Ord + Send + 'static,
+    K: Ord,
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> SkipMap<K, V> {
         let s = SkipMap::new();
         for (k, v) in iter {
-            s.insert(k, v);
+            s.get_or_insert(k, v);
         }
         s
     }
 }
 
-pub struct Entry<'a, K, V>
-where
-    K: Send + 'static,
-    V: 'a,
-{
+pub struct Entry<'a, K: 'a, V: 'a> {
     inner: base::Entry<'a, K, V>,
 }
 
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
-impl<'a, K, V> Entry<'a, K, V>
-where
-    K: Send + 'static,
-{
+impl<'a, K, V> Entry<'a, K, V> {
     fn new(inner: base::Entry<'a, K, V>) -> Entry<'a, K, V> {
         Entry { inner }
     }
@@ -187,7 +186,7 @@ where
 
 impl<'a, K, V> Entry<'a, K, V>
 where
-    K: Ord + Send + 'static,
+    K: Ord,
 {
     pub fn next(&mut self) -> bool {
         self.inner.next()
@@ -204,7 +203,12 @@ where
     pub fn get_prev(&self) -> Option<Entry<'a, K, V>> {
         self.inner.get_prev().map(Entry::new)
     }
+}
 
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Ord + Send + 'static,
+{
     /// Removes this entry from the map.
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
@@ -213,19 +217,7 @@ where
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V>
-where
-    K: Clone + Ord + Send + 'static,
-{
-    // pub fn replace(&mut self, value: V) -> Option<Entry<'a, K, V>> {
-    //     unimplemented!()
-    // }
-}
-
-impl<'a, K, V> Clone for Entry<'a, K, V>
-where
-    K: Send + 'static,
-{
+impl<'a, K, V> Clone for Entry<'a, K, V> {
     fn clone(&self) -> Entry<'a, K, V> {
         Entry {
             inner: self.inner.clone(),
@@ -237,7 +229,7 @@ where
 
 impl<'a, K, V> fmt::Debug for Entry<'a, K, V>
 where
-    K: Send + fmt::Debug + 'static,
+    K: fmt::Debug,
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -248,6 +240,7 @@ where
     }
 }
 
+// TODO: impl DoubleEndedIterator
 pub struct IntoIter<K, V> {
     inner: base::IntoIter<K, V>,
 }
@@ -271,46 +264,25 @@ where
     }
 }
 
-pub struct Iter<'a, K, V>
-where
-    K: Send + 'static,
-    V: 'a,
-{
-    parent: &'a SkipMap<K, V>,
-    entry: Option<Entry<'a, K, V>>,
-    finished: bool,
+// TODO: impl DoubleEndedIterator
+pub struct Iter<'a, K: 'a, V: 'a> {
+    inner: base::Iter<'a, K, V>,
 }
 
 impl<'a, K, V> Iterator for Iter<'a, K, V>
 where
-    K: Ord + Send + 'static,
-    V: 'a,
+    K: Ord,
 {
     type Item = Entry<'a, K, V>;
 
     fn next(&mut self) -> Option<Entry<'a, K, V>> {
-        if self.finished {
-            None
-        } else {
-            if let Some(e) = self.entry.as_mut() {
-                if e.next() {
-                    return Some(e.clone());
-                } else {
-                    self.finished = true;
-                    return None;
-                }
-            }
-
-            self.entry = self.parent.front();
-            self.finished = self.entry.is_none();
-            self.entry.clone()
-        }
+        self.inner.next().map(Entry::new)
     }
 }
 
 impl<'a, K, V> fmt::Debug for Iter<'a, K, V>
 where
-    K: Send + fmt::Debug,
+    K: fmt::Debug,
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
