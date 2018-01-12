@@ -159,15 +159,29 @@ fn stress_iter(limit: u32, num_permanent: usize) {
             }
         });
 
-        // TODO: Also iterate backwards.
+        scope.spawn(|| {
+            while Instant::now() < deadline {
+                let entries: Vec<_> = map.iter().rev().map(|e| (*e.key(), *e.value())).collect();
+                for w in entries.windows(2) {
+                    assert!(w[0] > w[1]);
+                }
+
+                let sum_values: u32 = entries.iter().map(|&(_, v)| v).sum();
+                assert_eq!(sum_values, sum_permanent);
+            }
+        });
     });
 }
 
 fn main() {
+    // TODO: random panics
+    // TODO: test with broken ordering
+    // TODO: count drops
+
     stress_small(8, 5);
     stress_small(8, 50);
     stress_small(16, 1000);
-    stress_small(500, 500);
+    stress_small(64, 500);
 
     stress_large(2);
     stress_large(8);
