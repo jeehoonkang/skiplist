@@ -36,6 +36,12 @@ fn stress_small(num_threads: usize, limit: u32) {
             });
         }
     });
+
+    assert_eq!(map.iter().count(), map.len());
+    map.clear();
+    assert_eq!(map.iter().count(), map.len());
+    assert_eq!(map.len(), 0);
+    assert!(map.is_empty());
 }
 
 fn stress_large(num_threads: usize) {
@@ -98,11 +104,17 @@ fn stress_large(num_threads: usize) {
             }
         });
 
-        let remaining: Vec<_> = map.into_iter().map(|(k, _)| k).collect();
+        let remaining: Vec<_> = map.iter().map(|e| *e.key()).collect();
 
         for x in blacklist.lock().unwrap().iter() {
             assert!(remaining.binary_search(x).is_err());
         }
+
+        assert_eq!(map.iter().count(), map.len());
+        map.clear();
+        assert_eq!(map.iter().count(), map.len());
+        assert_eq!(map.len(), 0);
+        assert!(map.is_empty());
     }
 }
 
@@ -171,12 +183,18 @@ fn stress_iter(limit: u32, num_permanent: usize) {
             }
         });
     });
+
+    assert_eq!(map.iter().count(), map.len());
+    map.clear();
+    assert_eq!(map.iter().count(), map.len());
+    assert_eq!(map.len(), 0);
+    assert!(map.is_empty());
 }
 
 fn main() {
-    // TODO: random panics
-    // TODO: test with broken ordering
-    // TODO: count drops
+    // TODO(stjepang): Panic randomly inside the comparison operator and make sure there is no UB.
+    // TODO(stjepang): Make a test with a broken (random?) comparison operator.
+    // TODO(stjepang): Count dropped keys and values to make sure there are no leaks.
 
     stress_small(8, 5);
     stress_small(8, 50);
