@@ -7,10 +7,5 @@ mod base;
 pub mod map;
 pub mod set;
 
-// TODO: pub mod range; // RangeArgument
-
 pub use map::SkipMap;
 pub use set::SkipSet;
-
-// TODO: Heap, impl as SkipListMap<K, ManuallyDrop<V>>
-// TODO: Entry::try_into_value()?

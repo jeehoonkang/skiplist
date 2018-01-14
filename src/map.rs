@@ -203,6 +203,8 @@ impl<'a, K, V> Entry<'a, K, V> {
     pub fn is_removed(&self) -> bool {
         self.inner.is_removed()
     }
+
+    // TODO(stjepang): Add `fn try_into_value(self)`.
 }
 
 impl<'a, K, V> Entry<'a, K, V>
