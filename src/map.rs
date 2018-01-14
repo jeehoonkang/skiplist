@@ -4,9 +4,7 @@ use std::iter::FromIterator;
 
 use base;
 
-// TODO: pop_front
-// TODO: pop_back
-
+/// A map based on a lock-free skip list.
 pub struct SkipMap<K, V> {
     inner: base::SkipList<K, V>,
 }
@@ -26,7 +24,8 @@ impl<K, V> SkipMap<K, V> {
 
     /// Returns the number of entries in the map.
     ///
-    /// The returned number is just an approximation if the map is being concurrently modified.
+    /// If the map is being concurrently modified, consider the returned number just an
+    /// approximation without any guarantees.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -55,7 +54,7 @@ where
         self.get(key).is_some()
     }
 
-    /// Returns an entry with the specified key.
+    /// Returns an entry with the specified `key`.
     pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -64,6 +63,8 @@ where
         self.inner.get(key).map(Entry::new)
     }
 
+    /// Returns the first entry with a key greater than or equal to `key`, or `None` if all entries
+    /// have smaller keys.
     pub fn seek<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -72,26 +73,26 @@ where
         self.inner.seek(key).map(Entry::new)
     }
 
-    /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
+    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
         Entry::new(self.inner.get_or_insert(key, value))
     }
 
-    /// TODO
+    /// Returns an iterator over all entries in the map.
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
             inner: self.inner.iter(),
         }
     }
 
-    // TODO: `pub fn range<Q, R>(&self, range: R) -> Range<K, V> where ...` (double ended iterator)
+    // TODO(stjepang): Add `fn range`.
 }
 
 impl<K, V> SkipMap<K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Inserts a key-value pair into the map and returns the new entry.
+    /// Inserts a `key`-`value` pair into the map and returns the new entry.
     ///
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
@@ -99,7 +100,7 @@ where
         Entry::new(self.inner.insert(key, value))
     }
 
-    /// Removes an entry with the specified key from the map and returns it.
+    /// Removes an entry with the specified `key` from the map and returns it.
     pub fn remove<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -108,7 +109,17 @@ where
         self.inner.remove(key).map(Entry::new)
     }
 
-    /// Iterates over the map and removes each entry.
+    /// Removes an entry from the front of the map.
+    pub fn pop_front(&self) -> Option<Entry<K, V>> {
+        self.inner.pop_front().map(Entry::new)
+    }
+
+    /// Removes an entry from the back of the map.
+    pub fn pop_back(&self) -> Option<Entry<K, V>> {
+        self.inner.pop_back().map(Entry::new)
+    }
+
+    /// Iterates over the map and removes every entry.
     pub fn clear(&self) {
         self.inner.clear();
     }
@@ -165,6 +176,7 @@ where
     }
 }
 
+/// A reference-counted entry in a map.
 pub struct Entry<'a, K: 'a, V: 'a> {
     inner: base::Entry<'a, K, V>,
 }
@@ -187,7 +199,7 @@ impl<'a, K, V> Entry<'a, K, V> {
         self.inner.value()
     }
 
-    /// Returns `true` if this entry is removed from the map.
+    /// Returns `true` if the entry is removed from the map.
     pub fn is_removed(&self) -> bool {
         self.inner.is_removed()
     }
@@ -197,18 +209,22 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord,
 {
+    /// Moves to the next entry in the map.
     pub fn next(&mut self) -> bool {
         self.inner.next()
     }
 
+    /// Moves to the previous entry in the map.
     pub fn prev(&mut self) -> bool {
         self.inner.prev()
     }
 
+    /// Returns the next entry in the map.
     pub fn get_next(&self) -> Option<Entry<'a, K, V>> {
         self.inner.get_next().map(Entry::new)
     }
 
+    /// Returns the previous entry in the map.
     pub fn get_prev(&self) -> Option<Entry<'a, K, V>> {
         self.inner.get_prev().map(Entry::new)
     }
@@ -218,7 +234,7 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Removes this entry from the map.
+    /// Removes the entry from the map.
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
@@ -247,7 +263,7 @@ where
     }
 }
 
-// TODO: impl DoubleEndedIterator
+/// An owning iterator over the entries of a `SkipMap`.
 pub struct IntoIter<K, V> {
     inner: base::IntoIter<K, V>,
 }
@@ -270,6 +286,7 @@ where
     }
 }
 
+/// An iterator over the entries of a `SkipMap`.
 pub struct Iter<'a, K: 'a, V: 'a> {
     inner: base::Iter<'a, K, V>,
 }
@@ -306,18 +323,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::SkipMap;
 
     #[test]
     fn smoke() {
         let m = SkipMap::new();
-
         m.insert(1, 10);
         m.insert(5, 50);
         m.insert(7, 70);
-
-        for e in &m {
-            println!("{:?}", e);
-        }
     }
+
+    // TODO(stjepang): Write more tests.
 }

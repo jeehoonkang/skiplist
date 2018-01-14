@@ -117,7 +117,7 @@ impl<K, V> Node<K, V> {
         true
     }
 
-    /// Returns `true` if this node is removed.
+    /// Returns `true` if the node is removed.
     #[inline]
     fn is_removed(&self) -> bool {
         let tag = unsafe {
@@ -773,6 +773,34 @@ where
         }
     }
 
+    /// Removes an entry from the front of the skip list.
+    pub fn pop_front(&self) -> Option<Entry<K, V>> {
+        loop {
+            match self.front() {
+                None => return None,
+                Some(e) => {
+                    if e.remove() {
+                        return Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes an entry from the back of the skip list.
+    pub fn pop_back(&self) -> Option<Entry<K, V>> {
+        loop {
+            match self.back() {
+                None => return None,
+                Some(e) => {
+                    if e.remove() {
+                        return Some(e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Iterates over the map and removes every entry.
     pub fn clear(&self) {
         /// Number of steps after which we repin the current thread and unlink removed nodes.
@@ -909,7 +937,7 @@ impl<'a, K, V> Entry<'a, K, V> {
         }
     }
 
-    /// Returns `true` if this entry is removed from the skip list.
+    /// Returns `true` if the entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
         self.node.is_removed()
     }
@@ -1022,7 +1050,7 @@ impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
 {
-    /// Removes this entry from the skip list.
+    /// Removes the entry from the skip list.
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
@@ -1121,7 +1149,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
-/// An iterator over the entries of `SkipList`.
+/// An iterator over the entries of a `SkipList`.
 pub struct Iter<'a, K: 'a, V: 'a> {
     /// The owning skip list.
     parent: &'a SkipList<K, V>,
