@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::cmp;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +18,7 @@ const HEIGHT_MASK: usize = (1 << HEIGHT_BITS) - 1;
 
 /// A skip list node.
 ///
-/// This struct is marked with `repr(C)` so that the specific order of fields can be enforced.
+/// This struct is marked with `repr(C)` so that the specific order of fields is enforced.
 /// It is important that the tower is the last field since it is dynamically sized. The key,
 /// reference count, and height are kept close to the tower to improve cache locality during
 /// skip list traversal.
@@ -29,7 +30,10 @@ pub struct Node<K, V> {
     /// The key.
     key: K,
 
-    /// Keeps the number of references to the node and the height of its tower.
+    /// Keeps the reference count and the height of its tower.
+    ///
+    /// The reference count is equal to the number of `Entry`s pointing to this node, plus the
+    /// number of levels in which this node is installed.
     refs_and_height: AtomicUsize,
 
     /// The tower of atomic pointers.
@@ -43,6 +47,7 @@ impl<K, V> Node<K, V> {
     /// with null pointers. However, the key and the value will be left uninitialized, and that is
     /// why this function is unsafe.
     unsafe fn alloc(height: usize) -> *mut Self {
+        // TODO(stjepang): Use the new alloc API instead of this hack once it becomes stable.
         let cap = Self::size_in_u64s(height);
         let mut v = Vec::<u64>::with_capacity(cap);
         let ptr = v.as_mut_ptr() as *mut Self;
@@ -62,7 +67,7 @@ impl<K, V> Node<K, V> {
         drop(Vec::from_raw_parts(ptr as *mut u64, 0, cap));
     }
 
-    /// Returns the size of a node with tower of given `height`, measured in `u64`s.
+    /// Returns the size of a node with tower of given `height` measured in `u64`s.
     fn size_in_u64s(height: usize) -> usize {
         assert!(1 <= height && height <= MAX_HEIGHT);
         assert!(mem::align_of::<Self>() <= mem::align_of::<u64>());
@@ -84,45 +89,15 @@ impl<K, V> Node<K, V> {
         (self.refs_and_height.load(Ordering::Relaxed) & HEIGHT_MASK) + 1
     }
 
+    /// Returns a reference to the pointer at the specified `level` in the tower.
+    ///
+    /// Argument `level` must be in the range `0..self.height()`.
     #[inline]
     unsafe fn tower(&self, level: usize) -> &Atomic<Self> {
         self.pointers.get_unchecked(level)
     }
 
-    /// Increments the reference counter of a node and returns `true` on success.
-    ///
-    /// The reference counter can be incremented only if it is positive.
-    ///
-    /// If the passed `ptr` is null, this function simply returns.
-    #[inline]
-    unsafe fn increment(ptr: *const Self) -> bool {
-        if ptr.is_null() {
-            return true;
-        }
-
-        let mut old = (*ptr).refs_and_height.load(Ordering::Relaxed);
-        loop {
-            if old & !HEIGHT_MASK == 0 {
-                return false;
-            }
-
-            if old == !HEIGHT_MASK {
-                panic!("reference count overflow");
-            }
-
-            match (*ptr).refs_and_height.compare_exchange_weak(
-                old,
-                old + (1 << HEIGHT_BITS),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(o) => old = o,
-            }
-        }
-    }
-
-    /// Marks all pointers in the tower and returns `true` if the level 0 wasn't already marked.
+    /// Marks all pointers in the tower and returns `true` if the level 0 was not marked.
     fn mark_tower(&self) -> bool {
         let height = self.height();
 
@@ -132,59 +107,92 @@ impl<K, V> Node<K, V> {
                     .fetch_or(1, Ordering::SeqCst, epoch::unprotected())
             };
 
+            // If the level 0 pointer was already marked, somebody else removed the node.
             if level == 0 && next.tag() == 1 {
                 return false;
             }
         }
 
+        // We marked the level 0 pointer, therefore we removed the node.
         true
     }
 
     /// Returns `true` if this node is removed.
+    #[inline]
     fn is_removed(&self) -> bool {
-        unsafe {
+        let tag = unsafe {
             self.tower(0)
                 .load(Ordering::SeqCst, epoch::unprotected())
-                .tag() == 1
-        }
+                .tag()
+        };
+        tag == 1
     }
 
-    /// Decrements the reference counter of a node, scheduling it for GC if the count becomes zero.
+    /// Attempts to increment the reference count of a node and returns `true` on success.
     ///
-    /// If the passed `ptr` is null, this function simply returns.
+    /// The reference count can be incremented only if it is non-zero.
     #[inline]
-    unsafe fn decrement(ptr: *const Self) {
-        if let Some(node) = ptr.as_ref() {
-            if node.refs_and_height
-                .fetch_sub(1 << HEIGHT_BITS, Ordering::AcqRel) >> HEIGHT_BITS == 1
-            {
-                Self::finalize(ptr);
+    unsafe fn increment(ptr: *const Self) -> bool {
+        let mut refs_and_height = (*ptr).refs_and_height.load(Ordering::Relaxed);
+
+        loop {
+            // If the reference count is zero, return `false`.
+            if refs_and_height & !HEIGHT_MASK == 0 {
+                return false;
+            }
+
+            // If all bits in the reference count are ones, we're about to overflow it.
+            if refs_and_height == !HEIGHT_MASK {
+                panic!("reference count overflow");
+            }
+
+            // Try incrementing the count.
+            match (*ptr).refs_and_height.compare_exchange_weak(
+                refs_and_height,
+                refs_and_height + (1 << HEIGHT_BITS),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => refs_and_height = current,
             }
         }
     }
 
-    /// Drops the value of a node and defers destruction of the key and deallocation.
+    /// Decrements the reference count of a node, destroying it if the count becomes zero.
+    #[inline]
+    unsafe fn decrement(ptr: *const Self) {
+        if (*ptr)
+            .refs_and_height
+            .fetch_sub(1 << HEIGHT_BITS, Ordering::AcqRel) >> HEIGHT_BITS == 1
+        {
+            Self::finalize(ptr);
+        }
+    }
+
+    /// Drops the value of a node, then defers destruction of the key and deallocation.
     #[cold]
     unsafe fn finalize(ptr: *const Self) {
         let ptr = ptr as *mut Self;
 
-        // The value can only be read if the reference counter is positive.
+        // The value can only be read if the reference count is positive, so it's safe to drop it
+        // right now.
         ptr::drop_in_place(&mut (*ptr).value);
 
         epoch::pin().defer(move || {
-            // The key can be read even if the reference counter is zero, assuming that the current
-            // thread is pinned. In order to safely drop the key, we have to first wait until all
-            // currently pinned threads get unpinned.
+            // However, the key can be read even if the reference count is zero, assuming that the
+            // current thread is pinned. In order to safely drop the key, we have to first wait
+            // until all currently pinned threads get unpinned.
             ptr::drop_in_place(&mut (*ptr).key);
 
             // Finally, deallocate the memory occupied by the node.
-            Node::dealloc(ptr)
+            Node::dealloc(ptr);
         });
     }
 }
 
-/// Often modified metadata associated with a skip list.
-struct Metadata {
+/// Frequently modified data associated with a skip list.
+struct HotData {
     /// The seed for random height generation.
     seed: AtomicUsize,
 
@@ -192,15 +200,16 @@ struct Metadata {
     len: AtomicUsize,
 }
 
+/// A lock-free skip list.
+// TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
+// create a custom collector, otherwise use the default one. Then we can also remove the
+// `K: 'static` bound.
 pub struct SkipList<K, V> {
     /// The head of the skip list (just a dummy node, not a real entry).
     head: *const Node<K, V>,
 
-    /// Metadata associated with the skip list, stored in a dedicated cache line.
-    metadata: Box<CachePadded<Metadata>>,
-    // TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
-    // create a custom collector, otherwise use the default one. Then we can also remove the
-    // `K: 'static` bound.
+    /// Hot data associated with the skip list, stored in a dedicated cache line.
+    hot_data: Box<CachePadded<HotData>>,
 }
 
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for SkipList<K, V> {}
@@ -211,7 +220,7 @@ impl<K, V> SkipList<K, V> {
     pub fn new() -> SkipList<K, V> {
         SkipList {
             head: unsafe { Node::alloc(MAX_HEIGHT) },
-            metadata: Box::new(CachePadded::new(Metadata {
+            hot_data: Box::new(CachePadded::new(HotData {
                 seed: AtomicUsize::new(1),
                 len: AtomicUsize::new(0),
             })),
@@ -223,11 +232,12 @@ impl<K, V> SkipList<K, V> {
         self.len() == 0
     }
 
-    /// Returns the number of entries in the map.
+    /// Returns the number of entries in the skip list.
     ///
-    /// The returned number is just an approximation if the map is being concurrently modified.
+    /// If the skip list is being concurrently modified, consider the returned number just an
+    /// approximation without any guarantees.
     pub fn len(&self) -> usize {
-        self.metadata.len.load(Ordering::SeqCst)
+        self.hot_data.len.load(Ordering::SeqCst)
     }
 }
 
@@ -241,14 +251,17 @@ where
 
         loop {
             unsafe {
+                // Load the level 0 successor of the head.
                 let head = &*self.head;
                 let ptr = head.tower(0).load(Ordering::SeqCst, guard);
 
                 match ptr.as_ref() {
                     None => return None,
                     Some(n) => {
+                        // If this node is removed, search for its key in order to unlink it.
                         if n.is_removed() {
                             self.search(Some(&n.key), guard);
+                        // If we can increment the reference count, return the entry.
                         } else if Node::increment(n) {
                             return Some(Entry::from_raw(self, n));
                         }
@@ -267,8 +280,10 @@ where
             let node = search.left[0];
 
             unsafe {
+                // If the last node is the head, the skip list is empty.
                 if ptr::eq(node, self.head) {
                     return None;
+                // If we can increment the reference count, return the entry.
                 } else if Node::increment(node) {
                     return Some(Entry::from_raw(self, node));
                 }
@@ -278,15 +293,20 @@ where
 
     /// Generates a random height and returns it.
     fn random_height(&self) -> usize {
-        // From "Xorshift RNGs" by George Marsaglia.
-        let mut num = self.metadata.seed.load(Ordering::Relaxed);
+        // Pseudorandom number generation from "Xorshift RNGs" by George Marsaglia.
+        //
+        // This particular set of operations generates 32-bit integers. See:
+        // https://en.wikipedia.org/wiki/Xorshift#Example_implementation
+        let mut num = self.hot_data.seed.load(Ordering::Relaxed);
         num ^= num << 13;
         num ^= num >> 17;
         num ^= num << 5;
-        self.metadata.seed.store(num, Ordering::Relaxed);
+        self.hot_data.seed.store(num, Ordering::Relaxed);
 
-        let mut height = num.trailing_zeros() as usize + 1;
+        let mut height = cmp::min(MAX_HEIGHT, num.trailing_zeros() as usize + 1);
         unsafe {
+            // Keep decreasing the height while it's much larger than all towers currently in the
+            // skip list.
             while height >= 4
                 && (*self.head)
                     .tower(height - 2)
@@ -299,21 +319,28 @@ where
         height
     }
 
+    /// Searches for a key in the skip list.
+    ///
+    /// If `key` is `None`, this method will search for an infinitely large key and reach the end
+    /// of the skip list.
     fn search<'g, Q>(&self, key: Option<&Q>, guard: &'g Guard) -> Search<'g, K, V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
         unsafe {
-            let mut s = Search {
-                found: false,
-                left: mem::uninitialized(),
-                right: mem::uninitialized(),
-            };
-
             'search: loop {
+                // The result of this search.
+                let mut search = Search {
+                    found: false,
+                    left: [&*self.head; MAX_HEIGHT],
+                    right: [Shared::null(); MAX_HEIGHT],
+                };
+
+                // The current level we're at.
                 let mut level = MAX_HEIGHT;
 
+                // Go down until we find a level at least one tower can actually reach.
                 while level >= 1
                     && (*self.head)
                         .tower(level - 1)
@@ -321,22 +348,19 @@ where
                         .is_null()
                 {
                     level -= 1;
-
-                    s.left[level] = &*self.head;
-                    s.right[level] = Shared::null();
                 }
 
                 // The current node we're at.
                 let mut node = &*self.head;
 
-                // Traverse the skip list from the highest to the lowest level.
                 while level >= 1 {
                     level -= 1;
 
+                    // Two adjacent nodes at the current level.
                     let mut pred = node;
                     let mut curr = pred.tower(level).load(Ordering::SeqCst, guard);
 
-                    // If `curr` is marked, that means `pred` is deleted and we have to restart the
+                    // If `curr` is marked, that means `pred` is removed and we have to restart the
                     // search.
                     if curr.tag() == 1 {
                         continue 'search;
@@ -348,7 +372,7 @@ where
                         let succ = c.tower(level).load(Ordering::SeqCst, guard);
 
                         if succ.tag() == 1 {
-                            // If `succ` is marked, that means `curr` is deleted. Let's try
+                            // If `succ` is marked, that means `curr` is removed. Let's try
                             // unlinking it from the skip list at this level.
                             match pred.tower(level).compare_and_set(
                                 curr,
@@ -357,7 +381,7 @@ where
                                 guard,
                             ) {
                                 Ok(_) => {
-                                    // On success, decrement the reference counter of `curr` and
+                                    // On success, decrement the reference count of `curr` and
                                     // continue searching through the current level.
                                     Node::decrement(curr.as_raw());
                                     curr = succ.with_tag(0);
@@ -383,20 +407,26 @@ where
                     }
 
                     // Store the position at the current level into the result.
-                    s.left[level] = pred;
-                    s.right[level] = curr;
+                    search.left[level] = pred;
+                    search.right[level] = curr;
 
                     node = pred;
                 }
 
                 // Check if we have found a node with key equal to `key`.
-                s.found = s.right[0].as_ref().map(|r| Some(r.key.borrow()) == key) == Some(true);
+                search.found = search.right[0]
+                    .as_ref()
+                    .map(|r| Some(r.key.borrow()) == key)
+                    == Some(true);
 
-                return s;
+                return search;
             }
         }
     }
 
+    /// Inserts an entry with the specified `key` and `value`.
+    ///
+    /// If `replace` is `true`, then any existing entry with this key will first be removed.
     fn insert_internal(&self, key: K, value: V, replace: bool) -> Entry<K, V> {
         let guard = &epoch::pin();
         let mut search;
@@ -411,29 +441,29 @@ where
                     break;
                 }
 
-                // If a node with the key was found and we're not going to replace it, let's try
-                // creating an entry positioned to it.
                 let r = search.right[0];
 
                 if replace {
+                    // If a node with the key was found and we should replace it, mark its tower
+                    // and then repeat the search.
                     if r.deref().mark_tower() {
-                        self.metadata.len.fetch_sub(1, Ordering::SeqCst);
+                        self.hot_data.len.fetch_sub(1, Ordering::SeqCst);
                     }
                 } else {
-                    // Try incrementing its reference count.
+                    // If a node with the key was found and we're not going to replace it, let's
+                    // try returning it as an entry.
                     if Node::increment(r.as_raw()) {
-                        // Success!
                         return Entry::from_raw(self, r.as_raw());
                     }
-                    // If we couldn't increment the reference count, that means that someone has
-                    // just deleted the node.
+
+                    // If we couldn't increment the reference count, that means someone has just
+                    // now removed the node.
                     break;
                 }
             }
 
             // Create a new node.
             let height = self.random_height();
-
             let (node, n) = {
                 let n = Node::<K, V>::alloc(height);
 
@@ -451,13 +481,13 @@ where
             };
 
             // Optimistically increment `len`.
-            self.metadata.len.fetch_add(1, Ordering::SeqCst);
+            self.hot_data.len.fetch_add(1, Ordering::SeqCst);
 
             loop {
                 // Set the lowest successor of `n` to `search.right[0]`.
                 n.tower(0).store(search.right[0], Ordering::SeqCst);
 
-                // Try installing the new node into the skip list.
+                // Try installing the new node into the skip list (at level 0).
                 if search.left[0]
                     .tower(0)
                     .compare_and_set(search.right[0], node, Ordering::SeqCst, guard)
@@ -477,35 +507,36 @@ where
                     self.search(Some(&n.key), guard)
                 };
 
-                // If a node with the key was found and we're not going to replace it, let's try
-                // creating an entry positioned to it.
                 if search.found {
                     let r = search.right[0];
 
                     if replace {
+                        // If a node with the key was found and we should replace it, mark its
+                        // tower and then repeat the search.
                         if r.deref().mark_tower() {
-                            self.metadata.len.fetch_sub(1, Ordering::SeqCst);
+                            self.hot_data.len.fetch_sub(1, Ordering::SeqCst);
                         }
                     } else {
-                        // Try incrementing its reference count.
+                        // If a node with the key was found and we're not going to replace it,
+                        // let's try returning it as an entry.
                         if Node::increment(r.as_raw()) {
-                            // Success! Let's deallocate the new node and return an entry
-                            // positioned to the existing one.
+                            // Destroy the new node.
                             let raw = node.as_raw() as *mut Node<K, V>;
                             ptr::drop_in_place(&mut (*raw).key);
                             ptr::drop_in_place(&mut (*raw).value);
                             Node::dealloc(raw);
-                            self.metadata.len.fetch_sub(1, Ordering::SeqCst);
+                            self.hot_data.len.fetch_sub(1, Ordering::SeqCst);
 
                             return Entry::from_raw(self, r.as_raw());
                         }
-                        // If we couldn't increment the reference count, that means that someone
-                        // has just deleted the node.
+
+                        // If we couldn't increment the reference count, that means someone has
+                        // just now removed the node.
                     }
                 }
             }
 
-            // The node was successfully inserted. Let's create an entry positioned to it.
+            // The new node was successfully installed. Let's create an entry associated with it.
             let entry = Entry::from_raw(self, n);
 
             // Build the rest of the tower above level 0.
@@ -515,11 +546,11 @@ where
                     let pred = search.left[level];
                     let succ = search.right[level];
 
-                    // Load the current value of the pointer in the tower.
+                    // Load the current value of the pointer in the tower at this level.
                     let next = n.tower(level).load(Ordering::SeqCst, guard);
 
                     // If the current pointer is marked, that means another thread is already
-                    // deleting the node we've just inserted. In that case, let's just stop
+                    // removing the node we've just inserted. In that case, let's just stop
                     // building the tower.
                     if next.tag() == 1 {
                         break 'build;
@@ -528,21 +559,22 @@ where
                     // When searching for `key` and traversing the skip list from the highest level
                     // to the lowest, it is possible to observe a node with an equal key at higher
                     // levels and then find it missing at the lower levels if it gets removed
-                    // during traversal.  Even worse, it is possible to observe completely
-                    // different nodes with the exact same key at different levels.
+                    // during traversal. Even worse, it is possible to observe completely different
+                    // nodes with the exact same key at different levels.
                     //
-                    // Linking the new node to a dead successor with an equal key would create
+                    // Linking the new node to a dead successor with an equal key could create
                     // subtle corner cases that would require special care. It's much easier to
-                    // simply prevent linking two nodes with equal keys.
+                    // simply prohibit linking two nodes with equal keys.
                     //
                     // If the successor has the same key as the new node, that means it is marked
-                    // as deleted and should be unlinked from the skip list. In that case, let's
+                    // as removed and should be unlinked from the skip list. In that case, let's
                     // repeat the search to make sure it gets unlinked and try again.
+                    //
+                    // If this comparison or the following search panics, we simply stop building
+                    // the tower without breaking any invariants. Note that building higher levels
+                    // is completely optional. Only the lowest level really matters, and all the
+                    // higher levels are there just to make searching faster.
                     if succ.as_ref().map(|s| &s.key) == Some(&n.key) {
-                        // If this search panics, we simply stop building the tower without
-                        // breaking any invariants. Note that building higher levels is completely
-                        // optional.  Only the lowest level really matters, and all the higher
-                        // levels are there just to make searching faster.
                         search = self.search(Some(&n.key), guard);
                         continue;
                     }
@@ -558,7 +590,7 @@ where
                     }
 
                     // Increment the reference count. The current value will always be at least 1
-                    // because we are holding
+                    // because we are holding `entry`.
                     (*n).refs_and_height
                         .fetch_add(1 << HEIGHT_BITS, Ordering::Relaxed);
 
@@ -585,9 +617,9 @@ where
                 }
             }
 
-            // If a pointer in the tower is marked, that means our node is in the process of
-            // deletion or already deleted. It is possible that another thread (either partially or
-            // completely) deleted the new node while we were building the tower, and just after
+            // If any pointer in the tower is marked, that means our node is in the process of
+            // removal or already removed. It is possible that another thread (either partially or
+            // completely) removed the new node while we were building the tower, and just after
             // that we installed the new node at one of the higher levels. In order to undo that
             // installation, we must repeat the search, which will unlink the new node at that
             // level.
@@ -595,15 +627,17 @@ where
                 self.search(Some(&n.key), guard);
             }
 
+            // Finally, return the new entry.
             entry
         }
     }
 
-    /// Finds an entry with the specified key, or inserts a new key-value pair if none exist.
+    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
         self.insert_internal(key, value, false)
     }
 
+    /// Returns an entry with the specified `key`.
     pub fn get<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -612,21 +646,25 @@ where
         let guard = &epoch::pin();
 
         loop {
+            // Search for a node with the specified key.
             let search = self.search(Some(key), guard);
             if !search.found {
                 return None;
             }
 
             let node = search.right[0].as_raw();
-
             unsafe {
+                // Try incrementing its reference count.
                 if Node::increment(node) {
+                    // Success! Return it as an entry.
                     return Some(Entry::from_raw(self, node));
                 }
             }
         }
     }
 
+    /// Returns the first entry with a key greater than or equal to `key`, or `None` if all entries
+    /// have smaller keys.
     pub fn seek<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -635,12 +673,15 @@ where
         let guard = &epoch::pin();
 
         loop {
+            // Search for a node with the specified key.
             let search = self.search(Some(key), guard);
             let node = search.right[0].as_raw();
+
             if node.is_null() {
                 return None;
             }
 
+            // Try incrementing its reference count.
             unsafe {
                 if Node::increment(node) {
                     return Some(Entry::from_raw(self, node));
@@ -649,6 +690,7 @@ where
         }
     }
 
+    /// Returns an iterator over all entries in the skip list.
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
             parent: self,
@@ -663,10 +705,15 @@ impl<K, V> SkipList<K, V>
 where
     K: Ord + Send + 'static,
 {
+    /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
+    ///
+    /// If there is an existing entry with this key, it will be removed before inserting the new
+    /// one.
     pub fn insert(&self, key: K, value: V) -> Entry<K, V> {
         self.insert_internal(key, value, true)
     }
 
+    /// Removes an entry with the specified `key` from the map and returns it.
     pub fn remove<Q>(&self, key: &Q) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
@@ -682,28 +729,39 @@ where
             }
 
             let node = search.right[0];
-
             unsafe {
                 let n = node.deref();
+
+                // First try incrementing the reference count because we have to return the node as
+                // an entry. If this fails, repeat the search.
                 if !Node::increment(n) {
                     continue;
                 }
 
+                // Create an entry.
                 let entry = Entry::from_raw(self, n);
 
+                // Try removing the node by marking its tower.
                 if n.mark_tower() {
-                    self.metadata.len.fetch_sub(1, Ordering::SeqCst);
+                    // Success! Decrement `len`.
+                    self.hot_data.len.fetch_sub(1, Ordering::SeqCst);
 
+                    // Unlink the node at each level of the skip list. We could do this by simply
+                    // repeating the search, but it's usually faster to unlink it manually using
+                    // the `left` and `right` lists.
                     for level in (0..n.height()).rev() {
                         let succ = n.tower(level).load(Ordering::SeqCst, guard).with_tag(0);
 
+                        // Try linking the predecessor and successor at this level.
                         if search.left[level]
                             .tower(level)
                             .compare_and_set(node, succ, Ordering::SeqCst, guard)
                             .is_ok()
                         {
+                            // Success! Decrement the reference count.
                             Node::decrement(n);
                         } else {
+                            // Failed! Just repeat the search to completely unlink the node.
                             self.search(Some(key), guard);
                             break;
                         }
@@ -715,26 +773,43 @@ where
         }
     }
 
+    /// Iterates over the map and removes every entry.
     pub fn clear(&self) {
-        /// Number of iteration steps after which we repin the current thread.
-        const REPIN_STEPS: usize = 128;
+        /// Number of steps after which we repin the current thread and unlink removed nodes.
+        const BATCH_SIZE: usize = 100;
 
         let guard = &mut epoch::pin();
-
-        let mut count = 0;
+        let mut step = 0;
 
         if let Some(mut entry) = self.front() {
             loop {
-                count += 1;
-                if count % REPIN_STEPS == 0 {
+                step += 1;
+                if step == BATCH_SIZE {
+                    step = 0;
+
+                    // Repin the current thread because we don't want to keep it pinned in the same
+                    // epoch for a too long time.
                     guard.repin();
+
+                    // Search for the current entry in order to unlink all the preceeding entries
+                    // we have removed.
+                    //
+                    // By unlinking nodes in batches we make sure that the final search doesn't
+                    // unlink all nodes at once, which could keep the current thread pinned for a
+                    // long time.
+                    self.search(Some(entry.key()), guard);
                 }
 
+                // Before removing the current entry, first obtain the following one.
                 let next = entry.get_next();
+
+                // Try removing the current entry.
                 if entry.node.mark_tower() {
-                    self.metadata.len.fetch_sub(1, Ordering::SeqCst);
+                    // Success! Decrement `len`.
+                    self.hot_data.len.fetch_sub(1, Ordering::SeqCst);
                 }
 
+                // Move to the following entry.
                 match next {
                     None => break,
                     Some(e) => entry = e,
@@ -742,6 +817,8 @@ where
             }
         }
 
+        // Finally, search for the end of the skip list in order to unlink all the remaining
+        // entries we have removed but not yet unlinked.
         self.search(None, guard);
     }
 }
@@ -750,17 +827,21 @@ impl<K, V> Drop for SkipList<K, V> {
     fn drop(&mut self) {
         let mut node = self.head as *mut Node<K, V>;
 
+        // Iterate through the whole skip list and destroy every node.
         while !node.is_null() {
             unsafe {
+                let next = (*node)
+                    .tower(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
+
+                // Destroy the key and the value in non-head nodes only.
                 if node as *const _ != self.head {
                     ptr::drop_in_place(&mut (*node).key);
                     ptr::drop_in_place(&mut (*node).value);
                 }
-
-                let next = (*node)
-                    .tower(0)
-                    .load(Ordering::Relaxed, epoch::unprotected());
+                // Deallocate every node, even the head.
                 Node::dealloc(node);
+
                 node = next.as_raw() as *mut Node<K, V>;
             }
         }
@@ -773,11 +854,13 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 
     fn into_iter(self) -> IntoIter<K, V> {
         unsafe {
-            let next = (*self.head)
+            // Load the front node.
+            let front = (*self.head)
                 .tower(0)
                 .load(Ordering::Relaxed, epoch::unprotected())
                 .as_raw();
 
+            // Clear the skip list by setting all pointers in head to null.
             for level in 0..MAX_HEIGHT {
                 (*self.head)
                     .tower(level)
@@ -785,7 +868,7 @@ impl<K, V> IntoIterator for SkipList<K, V> {
             }
 
             IntoIter {
-                node: next as *mut Node<K, V>,
+                node: front as *mut Node<K, V>,
             }
         }
     }
@@ -801,13 +884,14 @@ struct Search<'g, K: 'g, V: 'g> {
     /// More precisely, it will be `true` when `right[0].deref().key` equals the search key.
     found: bool,
 
-    /// Adjacent nodes with smaller keys.
+    /// Adjacent nodes with smaller keys (predecessors).
     left: [&'g Node<K, V>; MAX_HEIGHT],
 
-    /// Adjacent nodes with equal or greater keys.
+    /// Adjacent nodes with equal or greater keys (successors).
     right: [Shared<'g, Node<K, V>>; MAX_HEIGHT],
 }
 
+/// A reference-counted entry in a skip list.
 pub struct Entry<'a, K: 'a, V: 'a> {
     pub parent: &'a SkipList<K, V>,
     pub node: &'a Node<K, V>,
@@ -817,6 +901,7 @@ unsafe impl<'a, K: Send + Sync, V: Send + Sync> Send for Entry<'a, K, V> {}
 unsafe impl<'a, K: Send + Sync, V: Send + Sync> Sync for Entry<'a, K, V> {}
 
 impl<'a, K, V> Entry<'a, K, V> {
+    /// Constructs an entry from a raw pointer.
     unsafe fn from_raw(parent: &'a SkipList<K, V>, node: *const Node<K, V>) -> Self {
         Entry {
             parent,
@@ -866,35 +951,42 @@ where
         }
     }
 
+    /// Returns the next entry in the skip list.
     pub fn get_next(&self) -> Option<Entry<'a, K, V>> {
         let guard = &epoch::pin();
 
         loop {
             unsafe {
-                let succ = {
-                    let succ = self.node.tower(0).load(Ordering::SeqCst, guard);
-                    if succ.tag() == 0 {
-                        succ
+                // Load the successor to the current node.
+                let mut succ = self.node.tower(0).load(Ordering::SeqCst, guard);
+
+                if succ.tag() == 1 {
+                    // If the pointer is marked, search for the current key.
+                    let search = self.parent.search(Some(&self.node.key), guard);
+
+                    if search.found {
+                        // If an entry with the same key was found, load its successor.
+                        succ = search.right[0]
+                            .deref()
+                            .tower(0)
+                            .load(Ordering::SeqCst, guard);
                     } else {
-                        let search = self.parent.search(Some(&self.node.key), guard);
-                        if search.found {
-                            search.right[0]
-                                .deref()
-                                .tower(0)
-                                .load(Ordering::SeqCst, guard)
-                        } else {
-                            search.right[0]
-                        }
+                        // Otherwise, `right[0]` is the potential successor.
+                        succ = search.right[0];
+                    }
+
+                    // If the newly loaded pointer is marked as well, go back to start.
+                    if succ.tag() == 1 {
+                        continue;
                     }
                 };
 
-                if succ.tag() == 0 {
-                    match succ.as_ref() {
-                        None => return None,
-                        Some(s) => {
-                            if !s.is_removed() && Node::increment(s) {
-                                return Some(Entry::from_raw(self.parent, s));
-                            }
+                // Check if `succ` is a valid entry and, if so, return it.
+                match succ.as_ref() {
+                    None => return None,
+                    Some(s) => {
+                        if !s.is_removed() && Node::increment(s) {
+                            return Some(Entry::from_raw(self.parent, s));
                         }
                     }
                 }
@@ -902,19 +994,23 @@ where
         }
     }
 
+    /// Returns the previous entry in the skip list.
     pub fn get_prev(&self) -> Option<Entry<'a, K, V>> {
         let guard = &epoch::pin();
 
         loop {
+            // Search for the current key  to get the probable predecessor to the current entry.
             let search = self.parent.search(Some(self.key()), guard);
             let pred = search.left[0];
 
+            // If the predecessor is the head, there is no previous entry.
             if ptr::eq(pred, self.parent.head) {
                 return None;
             }
 
+            // Check if `pred` is a valid entry and, if so, return it.
             unsafe {
-                if Node::increment(pred) {
+                if !pred.is_removed() && Node::increment(pred) {
                     return Some(Entry::from_raw(self.parent, pred));
                 }
             }
@@ -930,10 +1026,14 @@ where
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
+        // Try marking the tower.
         if self.node.mark_tower() {
-            self.parent.metadata.len.fetch_sub(1, Ordering::SeqCst);
-            let guard = &epoch::pin();
-            self.parent.search(Some(&self.node.key), guard);
+            // Success - the entry is removed. Now decrement `len`.
+            self.parent.hot_data.len.fetch_sub(1, Ordering::SeqCst);
+
+            // Search for the key to unlink the node from the skip list.
+            self.parent.search(Some(&self.node.key), &epoch::pin());
+
             true
         } else {
             false
@@ -950,6 +1050,7 @@ impl<'a, K, V> Drop for Entry<'a, K, V> {
 impl<'a, K, V> Clone for Entry<'a, K, V> {
     fn clone(&self) -> Entry<'a, K, V> {
         unsafe {
+            // Incrementing will always succeed since we're already holding a reference to the node.
             Node::increment(self.node);
         }
         Entry {
@@ -959,8 +1060,31 @@ impl<'a, K, V> Clone for Entry<'a, K, V> {
     }
 }
 
+/// An owning iterator over the entries of a `SkipList`.
 pub struct IntoIter<K, V> {
+    /// The current node.
+    ///
+    /// All preceeding nods have already been destroyed.
     node: *mut Node<K, V>,
+}
+
+impl<K, V> Drop for IntoIter<K, V> {
+    fn drop(&mut self) {
+        // Iterate through the whole chain and destroy every node.
+        while !self.node.is_null() {
+            unsafe {
+                let next = (*self.node)
+                    .tower(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
+
+                ptr::drop_in_place(&mut (*self.node).key);
+                ptr::drop_in_place(&mut (*self.node).value);
+                Node::dealloc(self.node);
+
+                self.node = next.as_raw() as *mut Node<K, V>;
+            }
+        }
+    }
 }
 
 impl<K, V> Iterator for IntoIter<K, V> {
@@ -968,19 +1092,27 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
     fn next(&mut self) -> Option<(K, V)> {
         loop {
+            // Have we reached the end of the skip list?
             if self.node.is_null() {
                 return None;
             }
 
             unsafe {
+                // Take the key and value out of the node.
                 let key = ptr::read(&mut (*self.node).key);
                 let value = ptr::read(&mut (*self.node).value);
 
+                // Get the next node in the skip list.
                 let next = (*self.node)
                     .tower(0)
                     .load(Ordering::Relaxed, epoch::unprotected());
+
+                // Deallocate the current node and move to the next one.
+                Node::dealloc(self.node);
                 self.node = next.as_raw() as *mut Node<K, V>;
 
+                // The current node may be marked. If it is, it's been removed from the skip list
+                // and we should just skip it.
                 if next.tag() == 0 {
                     return Some((key, value));
                 }
@@ -989,10 +1121,18 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
+/// An iterator over the entries of `SkipList`.
 pub struct Iter<'a, K: 'a, V: 'a> {
+    /// The owning skip list.
     parent: &'a SkipList<K, V>,
+
+    /// The last returned entry from the front.
     front: Option<Entry<'a, K, V>>,
+
+    /// The last returned entry from the back.
     back: Option<Entry<'a, K, V>>,
+
+    /// `true` if iteration has finished (the front and back have met).
     finished: bool,
 }
 
@@ -1006,6 +1146,7 @@ where
         if self.finished {
             None
         } else {
+            // Advance the front one step forward.
             if self.front.is_none() {
                 self.front = self.parent.front();
             } else {
@@ -1015,6 +1156,7 @@ where
                 }
             }
 
+            // Check whether the front and the back have met.
             if let Some(f) = self.front.as_ref() {
                 if let Some(b) = self.back.as_ref() {
                     if f.key() >= b.key() {
@@ -1039,6 +1181,7 @@ where
         if self.finished {
             None
         } else {
+            // Advance the back one step backward.
             if self.back.is_none() {
                 self.back = self.parent.back();
             } else {
@@ -1048,6 +1191,7 @@ where
                 }
             }
 
+            // Check whether the front and the back have met.
             if let Some(b) = self.back.as_ref() {
                 if let Some(f) = self.front.as_ref() {
                     if f.key() >= b.key() {
