@@ -173,17 +173,12 @@ impl<K, V> Node<K, V> {
     /// Drops the value of a node, then defers destruction of the key and deallocation.
     #[cold]
     unsafe fn finalize(ptr: *const Self) {
-        let ptr = ptr as *mut Self;
-
-        // The value can only be read if the reference count is positive, so it's safe to drop it
-        // right now.
-        ptr::drop_in_place(&mut (*ptr).value);
-
         epoch::pin().defer(move || {
-            // However, the key can be read even if the reference count is zero, assuming that the
-            // current thread is pinned. In order to safely drop the key, we have to first wait
-            // until all currently pinned threads get unpinned.
+            let ptr = ptr as *mut Self;
+
+            // Call destructors: drop the key and the value.
             ptr::drop_in_place(&mut (*ptr).key);
+            ptr::drop_in_place(&mut (*ptr).value);
 
             // Finally, deallocate the memory occupied by the node.
             Node::dealloc(ptr);
@@ -201,9 +196,9 @@ struct HotData {
 }
 
 /// A lock-free skip list.
-// TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()`,
-// create a custom collector, otherwise use the default one. Then we can also remove the
-// `K: 'static` bound.
+// TODO(stjepang): Embed a custom `crossbeam_epoch::Collector` here. If `needs_drop::<K>()` or
+// `needs_drop::<V>()`, create a custom collector, otherwise use the default one. Then we can also
+// remove the `K: Send + 'static` and `V: Send + 'static` bounds.
 pub struct SkipList<K, V> {
     /// The head of the skip list (just a dummy node, not a real entry).
     head: *const Node<K, V>,
@@ -704,6 +699,7 @@ where
 impl<K, V> SkipList<K, V>
 where
     K: Ord + Send + 'static,
+    V: Send + 'static,
 {
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
     ///
@@ -1049,6 +1045,7 @@ where
 impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
+    V: Send + 'static,
 {
     /// Removes the entry from the skip list.
     ///
@@ -1654,7 +1651,7 @@ mod tests {
         let key7 = Key(7);
         s.remove(&key7);
         assert_eq!(KEYS.load(Ordering::SeqCst), 0);
-        assert_eq!(VALUES.load(Ordering::SeqCst), 1);
+        assert_eq!(VALUES.load(Ordering::SeqCst), 0);
 
         drop(s);
 

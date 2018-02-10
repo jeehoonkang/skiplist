@@ -91,6 +91,7 @@ where
 impl<K, V> SkipMap<K, V>
 where
     K: Ord + Send + 'static,
+    V: Send + 'static,
 {
     /// Inserts a `key`-`value` pair into the map and returns the new entry.
     ///
@@ -235,6 +236,7 @@ where
 impl<'a, K, V> Entry<'a, K, V>
 where
     K: Ord + Send + 'static,
+    V: Send + 'static,
 {
     /// Removes the entry from the map.
     ///
