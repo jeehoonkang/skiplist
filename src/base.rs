@@ -1235,7 +1235,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 
     use super::SkipList;
 
@@ -1621,8 +1621,8 @@ mod tests {
 
     #[test]
     fn drops() {
-        static KEYS: AtomicUsize = AtomicUsize::new(0);
-        static VALUES: AtomicUsize = AtomicUsize::new(0);
+        static KEYS: AtomicUsize = ATOMIC_USIZE_INIT;
+        static VALUES: AtomicUsize = ATOMIC_USIZE_INIT;
 
         #[derive(Eq, PartialEq, Ord, PartialOrd)]
         struct Key(i32);
